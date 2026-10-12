@@ -1,0 +1,389 @@
+From 7b780d521eaa9ed475b84a560f6263a24a936c0f Mon Sep 17 00:00:00 2001
+From: Kevin Per <kevin.per@ebcont.com>
+Date: Mon, 12 Oct 2026 14:09:19 +0200
+Subject: [PATCH 8/8] Fixed concurrency issue
+
+---
+ .../java/com/ebcont/k8/triage/AiConfig.java   | 53 +++++++++++
+ .../ebcont/k8/triage/InvestigatorAgent.java   | 90 +++++++++++++++++--
+ .../k8/triage/KubernetesDiagnosticTools.java  | 40 +++------
+ .../com/ebcont/k8/triage/TriageWorkers.java   | 16 ++--
+ .../ebcont/k8/triage/InvestigatorAgentIT.java | 10 ++-
+ 5 files changed, 163 insertions(+), 46 deletions(-)
+ create mode 100644 src/main/java/com/ebcont/k8/triage/AiConfig.java
+
+diff --git a/src/main/java/com/ebcont/k8/triage/AiConfig.java b/src/main/java/com/ebcont/k8/triage/AiConfig.java
+new file mode 100644
+index 0000000..53e4adc
+--- /dev/null
++++ b/src/main/java/com/ebcont/k8/triage/AiConfig.java
+@@ -0,0 +1,53 @@
++package com.ebcont.k8.triage;
++
++import org.springframework.ai.chat.memory.ChatMemory;
++import org.springframework.ai.chat.memory.InMemoryChatMemoryRepository;
++import org.springframework.ai.chat.memory.MessageWindowChatMemory;
++import org.springframework.ai.chat.messages.AssistantMessage;
++import org.springframework.ai.chat.messages.Message;
++import org.springframework.context.annotation.Bean;
++import org.springframework.context.annotation.Configuration;
++import org.springframework.util.StringUtils;
++
++import java.util.List;
++
++@Configuration
++public class AiConfig {
++
++    /**
++     * Holds each investigation as its own conversation, including every tool call and result. The window must fit a
++     * whole investigation (two messages per tool round): older messages are dropped silently.
++     */
++    @Bean
++    ChatMemory chatMemory() {
++        return new SkipEmptyAssistantMessages(MessageWindowChatMemory.builder()
++                .chatMemoryRepository(new InMemoryChatMemoryRepository())
++                .maxMessages(500)
++                .build());
++    }
++
++    /**
++     * Bedrock returns a reasoning model's (gpt-oss) reasoning as an extra generation without text or tool calls. The
++     * memory advisor stores every generation, and Bedrock rejects such an empty message when it is sent back
++     * ("The content field in the Message object ... is empty"), so it is not stored.
++     */
++    record SkipEmptyAssistantMessages(ChatMemory delegate) implements ChatMemory {
++
++        @Override
++        public void add(String conversationId, List<Message> messages) {
++            delegate.add(conversationId, messages.stream()
++                    .filter(m -> !(m instanceof AssistantMessage a && !a.hasToolCalls() && !StringUtils.hasText(a.getText())))
++                    .toList());
++        }
++
++        @Override
++        public List<Message> get(String conversationId) {
++            return delegate.get(conversationId);
++        }
++
++        @Override
++        public void clear(String conversationId) {
++            delegate.clear(conversationId);
++        }
++    }
++}
+diff --git a/src/main/java/com/ebcont/k8/triage/InvestigatorAgent.java b/src/main/java/com/ebcont/k8/triage/InvestigatorAgent.java
+index a7f2364..6e6e6b0 100644
+--- a/src/main/java/com/ebcont/k8/triage/InvestigatorAgent.java
++++ b/src/main/java/com/ebcont/k8/triage/InvestigatorAgent.java
+@@ -1,26 +1,104 @@
+ package com.ebcont.k8.triage;
+ 
+ import org.springframework.ai.chat.client.ChatClient;
++import org.springframework.ai.chat.client.advisor.MessageChatMemoryAdvisor;
++import org.springframework.ai.chat.client.advisor.ToolCallingAdvisor;
++import org.springframework.ai.chat.memory.ChatMemory;
++import org.springframework.ai.chat.messages.AssistantMessage;
++import org.springframework.ai.chat.messages.Message;
++import org.springframework.ai.chat.messages.ToolResponseMessage;
+ import org.springframework.stereotype.Component;
++import tools.jackson.core.JacksonException;
++import tools.jackson.core.type.TypeReference;
++import tools.jackson.databind.json.JsonMapper;
+ 
++import java.util.ArrayList;
++import java.util.HashMap;
+ import java.util.List;
++import java.util.Map;
++import java.util.stream.Collectors;
+ 
+ @Component
+ public class InvestigatorAgent {
+ 
++    /**
++     * The investigator's answer and every tool call it made with its output, for the root cause agent: the
++     * investigator only summarises, so the evidence lives in the tool results.
++     */
++    public record Investigation(String answer, List<String> evidence) {
++    }
++
+     private final ChatClient chatClient;
++    private final ChatMemory chatMemory;
+ 
+-    public InvestigatorAgent(ChatClient.Builder builder, KubernetesDiagnosticTools diagnosticTools) {
++    public InvestigatorAgent(ChatClient.Builder builder, KubernetesDiagnosticTools diagnosticTools, ChatMemory chatMemory) {
++        this.chatMemory = chatMemory;
+         this.chatClient = builder
+                 .defaultSystem(KubernetesDiagnosticTools.INVESTIGATOR_PROMPT)
+                 .defaultTools(diagnosticTools)
++                .defaultAdvisors(MessageChatMemoryAdvisor.builder(chatMemory)
++                        .order(ToolCallingAdvisor.DEFAULT_ORDER + 1)
++                        .build())
+                 .build();
+     }
+ 
+-    public String investigate(List<String> namespaces) {
+-        return chatClient.prompt()
+-                .user("Investigate the workloads in these Kubernetes namespaces: " + String.join(", ", namespaces))
+-                .call()
+-                .content();
++    /**
++     * Investigates the namespaces as conversation {@code conversationId}, which must be unique per investigation, and
++     * returns the evidence from it. The conversation is removed from the chat memory afterwards.
++     */
++    public Investigation investigate(String conversationId, List<String> namespaces) {
++        chatMemory.clear(conversationId);
++        try {
++            String answer = chatClient.prompt()
++                    .user("Investigate the workloads in these Kubernetes namespaces: " + String.join(", ", namespaces))
++                    .advisors(a -> a.param(ChatMemory.CONVERSATION_ID, conversationId))
++                    .call()
++                    .content();
++            return new Investigation(answer, evidence(chatMemory.get(conversationId)));
++        } finally {
++            chatMemory.clear(conversationId);
++        }
++    }
++
++    /** Every tool call in the conversation with its arguments and result. */
++    private static List<String> evidence(List<Message> conversation) {
++        Map<String, AssistantMessage.ToolCall> toolCalls = new HashMap<>();
++        List<String> evidence = new ArrayList<>();
++        for (Message message : conversation) {
++            if (message instanceof AssistantMessage assistant) {
++                assistant.getToolCalls().forEach(call -> toolCalls.put(call.id(), call));
++            } else if (message instanceof ToolResponseMessage toolResponses) {
++                for (ToolResponseMessage.ToolResponse response : toolResponses.getResponses()) {
++                    AssistantMessage.ToolCall call = toolCalls.get(response.id());
++                    String arguments = call == null ? "" : arguments(call.arguments());
++                    evidence.add("### " + response.name() + "(" + arguments + ")\n" + toolResult(response.responseData()));
++                }
++            }
++        }
++        return evidence;
++    }
++
++    /**
++     * Tool arguments as {@code namespace=default, id=api-1}: without JSON quotes, which the root cause agent would
++     * have to escape when it quotes the evidence in its JSON report.
++     */
++    private static String arguments(String json) {
++        try {
++            return JsonMapper.shared().readValue(json, new TypeReference<Map<String, Object>>() {
++            }).entrySet().stream()
++                    .map(e -> e.getKey() + "=" + e.getValue())
++                    .collect(Collectors.joining(", "));
++        } catch (JacksonException e) {
++            return json;
++        }
++    }
++
++    /** Spring AI stores a tool's String result JSON-encoded; decode it back to the text the tool returned. */
++    private static String toolResult(String responseData) {
++        try {
++            return JsonMapper.shared().readValue(responseData, String.class);
++        } catch (JacksonException e) {
++            return responseData;
++        }
+     }
+ }
+diff --git a/src/main/java/com/ebcont/k8/triage/KubernetesDiagnosticTools.java b/src/main/java/com/ebcont/k8/triage/KubernetesDiagnosticTools.java
+index be82b71..074f80f 100644
+--- a/src/main/java/com/ebcont/k8/triage/KubernetesDiagnosticTools.java
++++ b/src/main/java/com/ebcont/k8/triage/KubernetesDiagnosticTools.java
+@@ -18,8 +18,6 @@ import org.springframework.ai.tool.annotation.ToolParam;
+ import org.springframework.beans.factory.annotation.Value;
+ import org.springframework.stereotype.Component;
+ 
+-import java.util.ArrayList;
+-import java.util.Collections;
+ import java.util.Comparator;
+ import java.util.List;
+ import java.util.Map;
+@@ -44,7 +42,6 @@ public class KubernetesDiagnosticTools {
+ 
+     private final KubernetesClient client;
+     private final int logTailLines;
+-    private final List<String> evidence = Collections.synchronizedList(new ArrayList<>());
+ 
+     public KubernetesDiagnosticTools(KubernetesClient client, @Value("${k8s.log-tail-lines:200}") int logTailLines) {
+         this.client = client;
+@@ -53,7 +50,7 @@ public class KubernetesDiagnosticTools {
+ 
+     @Tool(description = "List pods in a namespace with ready containers, status, restarts and owner (like `kubectl get pods`).")
+     public String listPods(@ToolParam(description = "Namespace to list pods in") String namespace) {
+-        return call("listPods(" + namespace + ")", () -> {
++        return call(() -> {
+             List<Pod> pods = client.pods().inNamespace(namespace).list().getItems();
+             if (pods.isEmpty()) {
+                 return "No pods found in namespace " + namespace + ".";
+@@ -89,7 +86,7 @@ public class KubernetesDiagnosticTools {
+     @Tool(description = "Fetch recent container logs for a pod (like `kubectl logs`).")
+     public String getPodLogs(@ToolParam(description = "Pod name") String id,
+                              @ToolParam(description = "Namespace of the pod") String namespace) {
+-        return call("getPodLogs(" + namespace + ", " + id + ")", () -> {
++        return call(() -> {
+             Pod pod = client.pods().inNamespace(namespace).withName(id).get();
+             if (pod == null) {
+                 return notFound("Pod", id, namespace);
+@@ -119,7 +116,7 @@ public class KubernetesDiagnosticTools {
+     @Tool(description = "Describe a pod: image, resource limits, env var names, container state and last state (like `kubectl describe pod`).")
+     public String describePod(@ToolParam(description = "Pod name") String id,
+                               @ToolParam(description = "Namespace of the pod") String namespace) {
+-        return call("describePod(" + namespace + ", " + id + ")", () -> {
++        return call(() -> {
+             Pod pod = client.pods().inNamespace(namespace).withName(id).get();
+             if (pod == null) {
+                 return notFound("Pod", id, namespace);
+@@ -166,7 +163,7 @@ public class KubernetesDiagnosticTools {
+     @Tool(description = "Fetch Kubernetes events for a pod (like `kubectl get events --field-selector involvedObject.name=<pod>`).")
+     public String getPodEvents(@ToolParam(description = "Pod name") String id,
+                                @ToolParam(description = "Namespace of the pod") String namespace) {
+-        return call("getPodEvents(" + namespace + ", " + id + ")", () -> {
++        return call(() -> {
+             List<Event> events = client.v1().events().inNamespace(namespace)
+                     .withField("involvedObject.name", id)
+                     .list().getItems();
+@@ -188,7 +185,7 @@ public class KubernetesDiagnosticTools {
+ 
+     @Tool(description = "List deployments in a namespace with ready replicas and current image (like `kubectl get deployments`).")
+     public String listDeployments(@ToolParam(description = "Namespace to list deployments in") String namespace) {
+-        return call("listDeployments(" + namespace + ")", () -> {
++        return call(() -> {
+             List<Deployment> deployments = client.apps().deployments().inNamespace(namespace).list().getItems();
+             if (deployments.isEmpty()) {
+                 return "No deployments found in namespace " + namespace + ".";
+@@ -209,7 +206,7 @@ public class KubernetesDiagnosticTools {
+     @Tool(description = "Describe a deployment: strategy, conditions and rollout history (like `kubectl describe deployment` plus `kubectl rollout history`).")
+     public String describeDeployment(@ToolParam(description = "Deployment name") String deployment,
+                                      @ToolParam(description = "Namespace of the deployment") String namespace) {
+-        return call("describeDeployment(" + namespace + ", " + deployment + ")", () -> {
++        return call(() -> {
+             Deployment d = client.apps().deployments().inNamespace(namespace).withName(deployment).get();
+             if (d == null) {
+                 return notFound("Deployment", deployment, namespace);
+@@ -276,31 +273,14 @@ public class KubernetesDiagnosticTools {
+         });
+     }
+ 
+-    /**
+-     * Every tool call and its output since the last {@link #clearEvidence()}, for the root cause agent: the
+-     * investigator only replies that it is done, so the evidence lives in these tool results.
+-     */
+-    public List<String> evidence() {
+-        synchronized (evidence) {
+-            return List.copyOf(evidence);
+-        }
+-    }
+-
+-    public void clearEvidence() {
+-        evidence.clear();
+-    }
+-
+-    private String call(String toolCall, Supplier<String> action) {
+-        String result;
++    private static String call(Supplier<String> action) {
+         try {
+-            result = action.get();
++            return action.get();
+         } catch (KubernetesClientException e) {
+-            result = "Error: Kubernetes API call failed (HTTP " + e.getCode() + "): " + e.getMessage();
++            return "Error: Kubernetes API call failed (HTTP " + e.getCode() + "): " + e.getMessage();
+         } catch (RuntimeException e) {
+-            result = "Error: " + e.getMessage();
++            return "Error: " + e.getMessage();
+         }
+-        evidence.add("### " + toolCall + "\n" + result);
+-        return result;
+     }
+ 
+     private static String notFound(String kind, String name, String namespace) {
+diff --git a/src/main/java/com/ebcont/k8/triage/TriageWorkers.java b/src/main/java/com/ebcont/k8/triage/TriageWorkers.java
+index c3af13f..cb9126c 100644
+--- a/src/main/java/com/ebcont/k8/triage/TriageWorkers.java
++++ b/src/main/java/com/ebcont/k8/triage/TriageWorkers.java
+@@ -2,6 +2,7 @@ package com.ebcont.k8.triage;
+ 
+ import io.camunda.client.annotation.JobWorker;
+ import io.camunda.client.annotation.Variable;
++import io.camunda.client.api.response.ActivatedJob;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+@@ -21,24 +22,21 @@ public class TriageWorkers {
+ 
+     private final InvestigatorAgent investigator;
+     private final RootCauseAgent rootCause;
+-    private final KubernetesDiagnosticTools diagnosticTools;
+     private final RollbackTools rollbackTools;
+ 
+-    public TriageWorkers(InvestigatorAgent investigator, RootCauseAgent rootCause,
+-                         KubernetesDiagnosticTools diagnosticTools, RollbackTools rollbackTools) {
++    public TriageWorkers(InvestigatorAgent investigator, RootCauseAgent rootCause, RollbackTools rollbackTools) {
+         this.investigator = investigator;
+         this.rootCause = rootCause;
+-        this.diagnosticTools = diagnosticTools;
+         this.rollbackTools = rollbackTools;
+     }
+ 
+     @JobWorker(type = "investigate", timeout = LLM_TIMEOUT_MS, fetchVariables = "namespaces")
+-    public Map<String, Object> investigate(@Variable("namespaces") List<String> namespaces) {
++    public Map<String, Object> investigate(ActivatedJob job, @Variable("namespaces") List<String> namespaces) {
+         log.info("Starting investigation of namespaces {}", namespaces);
+-        diagnosticTools.clearEvidence();
+-        String answer = investigator.investigate(namespaces);
+-        log.info("Investigator: {}", answer);
+-        return Map.of("investigationEvidence", diagnosticTools.evidence(), "investigationAnswer", answer);
++        InvestigatorAgent.Investigation investigation =
++                investigator.investigate("triage-" + job.getProcessInstanceKey(), namespaces);
++        log.info("Investigator: {}", investigation.answer());
++        return Map.of("investigationEvidence", investigation.evidence(), "investigationAnswer", investigation.answer());
+     }
+ 
+     @JobWorker(type = "analyse-root-cause", timeout = LLM_TIMEOUT_MS,
+diff --git a/src/test/java/com/ebcont/k8/triage/InvestigatorAgentIT.java b/src/test/java/com/ebcont/k8/triage/InvestigatorAgentIT.java
+index 20c2d5b..7d549b2 100644
+--- a/src/test/java/com/ebcont/k8/triage/InvestigatorAgentIT.java
++++ b/src/test/java/com/ebcont/k8/triage/InvestigatorAgentIT.java
+@@ -5,12 +5,16 @@ import org.junit.jupiter.api.Tag;
+ import org.junit.jupiter.api.Test;
+ import org.junit.jupiter.api.extension.ExtendWith;
+ import org.mockito.ArgumentCaptor;
++import org.mockito.ArgumentMatchers;
+ import org.springframework.ai.chat.client.ChatClient;
++import org.springframework.ai.chat.client.advisor.api.Advisor;
++import org.springframework.ai.chat.memory.MessageWindowChatMemory;
+ 
+ import java.io.IOException;
+ import java.io.InputStream;
+ import java.nio.charset.StandardCharsets;
+ import java.util.List;
++import java.util.function.Consumer;
+ 
+ import static org.assertj.core.api.Assertions.assertThat;
+ import static org.mockito.ArgumentMatchers.any;
+@@ -37,7 +41,9 @@ class InvestigatorAgentIT {
+         KubernetesDiagnosticTools tools = new KubernetesDiagnosticTools(client, 200);
+         stubChatClient(staticAnswer());
+ 
+-        String answer = new InvestigatorAgent(builder, tools).investigate(List.of("default"));
++        String answer = new InvestigatorAgent(builder, tools, MessageWindowChatMemory.builder().build())
++                .investigate("investigator-it", List.of("default"))
++                .answer();
+ 
+         String api = tools.describeDeployment("api", "default");
+         String web = tools.describeDeployment("web", "default");
+@@ -53,9 +59,11 @@ class InvestigatorAgentIT {
+     private void stubChatClient(String answer) {
+         when(builder.defaultSystem(anyString())).thenReturn(builder);
+         when(builder.defaultTools(any())).thenReturn(builder);
++        when(builder.defaultAdvisors(any(Advisor[].class))).thenReturn(builder);
+         when(builder.build()).thenReturn(chatClient);
+         when(chatClient.prompt()).thenReturn(request);
+         when(request.user(anyString())).thenReturn(request);
++        when(request.advisors(ArgumentMatchers.<Consumer<ChatClient.AdvisorSpec>>any())).thenReturn(request);
+         when(request.call()).thenReturn(response);
+         when(response.content()).thenReturn(answer);
+     }
+-- 
+2.53.0
+
