@@ -1,0 +1,401 @@
+From e5c9dbd88cea583afd011c424e760d4e04c76207 Mon Sep 17 00:00:00 2001
+From: Kevin Per <kevin.per@ebcont.com>
+Date: Mon, 12 Oct 2026 09:58:36 +0200
+Subject: [PATCH 6/7] Created root cause agent
+
+---
+ .../k8/triage/KubernetesDiagnosticTools.java  | 45 +++++++---
+ .../com/ebcont/k8/triage/RootCauseAgent.java  | 38 +++++++++
+ .../com/ebcont/k8/triage/RootCauseReport.java | 66 +++++++++++++++
+ .../com/ebcont/k8/triage/TriageRunner.java    | 35 +++++++-
+ src/test/resources/root-cause-answer.json     | 83 +++++++++++++++++++
+ 5 files changed, 252 insertions(+), 15 deletions(-)
+ create mode 100644 src/main/java/com/ebcont/k8/triage/RootCauseAgent.java
+ create mode 100644 src/main/java/com/ebcont/k8/triage/RootCauseReport.java
+ create mode 100644 src/test/resources/root-cause-answer.json
+
+diff --git a/src/main/java/com/ebcont/k8/triage/KubernetesDiagnosticTools.java b/src/main/java/com/ebcont/k8/triage/KubernetesDiagnosticTools.java
+index 6acce92..be82b71 100644
+--- a/src/main/java/com/ebcont/k8/triage/KubernetesDiagnosticTools.java
++++ b/src/main/java/com/ebcont/k8/triage/KubernetesDiagnosticTools.java
+@@ -18,6 +18,8 @@ import org.springframework.ai.tool.annotation.ToolParam;
+ import org.springframework.beans.factory.annotation.Value;
+ import org.springframework.stereotype.Component;
+ 
++import java.util.ArrayList;
++import java.util.Collections;
+ import java.util.Comparator;
+ import java.util.List;
+ import java.util.Map;
+@@ -31,9 +33,8 @@ public class KubernetesDiagnosticTools {
+     public static String INVESTIGATOR_PROMPT = """
+             You are a Kubernetes SRE collecting evidence about a cluster. Use the tools
+             to find unhealthy pods and deployments. For every unhealthy workload, gather its pod details, logs
+-            and events, its Kubernetes deployment and rollout history, and the matching GitHub repo's recent
+-            deployments and commit diffs. Changes made outside GitHub (e.g. manual kubectl edits) are also
+-            possible. Do not diagnose: a separate root cause agent will analyse everything you collect.
++            and events, its Kubernetes deployment and rollout history.
++            Do not diagnose: a separate root cause agent will analyse everything you collect.
+             When you have gathered enough evidence, reply with relevant findings.
+             """;
+ 
+@@ -43,6 +44,7 @@ public class KubernetesDiagnosticTools {
+ 
+     private final KubernetesClient client;
+     private final int logTailLines;
++    private final List<String> evidence = Collections.synchronizedList(new ArrayList<>());
+ 
+     public KubernetesDiagnosticTools(KubernetesClient client, @Value("${k8s.log-tail-lines:200}") int logTailLines) {
+         this.client = client;
+@@ -51,7 +53,7 @@ public class KubernetesDiagnosticTools {
+ 
+     @Tool(description = "List pods in a namespace with ready containers, status, restarts and owner (like `kubectl get pods`).")
+     public String listPods(@ToolParam(description = "Namespace to list pods in") String namespace) {
+-        return call(() -> {
++        return call("listPods(" + namespace + ")", () -> {
+             List<Pod> pods = client.pods().inNamespace(namespace).list().getItems();
+             if (pods.isEmpty()) {
+                 return "No pods found in namespace " + namespace + ".";
+@@ -87,7 +89,7 @@ public class KubernetesDiagnosticTools {
+     @Tool(description = "Fetch recent container logs for a pod (like `kubectl logs`).")
+     public String getPodLogs(@ToolParam(description = "Pod name") String id,
+                              @ToolParam(description = "Namespace of the pod") String namespace) {
+-        return call(() -> {
++        return call("getPodLogs(" + namespace + ", " + id + ")", () -> {
+             Pod pod = client.pods().inNamespace(namespace).withName(id).get();
+             if (pod == null) {
+                 return notFound("Pod", id, namespace);
+@@ -117,7 +119,7 @@ public class KubernetesDiagnosticTools {
+     @Tool(description = "Describe a pod: image, resource limits, env var names, container state and last state (like `kubectl describe pod`).")
+     public String describePod(@ToolParam(description = "Pod name") String id,
+                               @ToolParam(description = "Namespace of the pod") String namespace) {
+-        return call(() -> {
++        return call("describePod(" + namespace + ", " + id + ")", () -> {
+             Pod pod = client.pods().inNamespace(namespace).withName(id).get();
+             if (pod == null) {
+                 return notFound("Pod", id, namespace);
+@@ -164,7 +166,7 @@ public class KubernetesDiagnosticTools {
+     @Tool(description = "Fetch Kubernetes events for a pod (like `kubectl get events --field-selector involvedObject.name=<pod>`).")
+     public String getPodEvents(@ToolParam(description = "Pod name") String id,
+                                @ToolParam(description = "Namespace of the pod") String namespace) {
+-        return call(() -> {
++        return call("getPodEvents(" + namespace + ", " + id + ")", () -> {
+             List<Event> events = client.v1().events().inNamespace(namespace)
+                     .withField("involvedObject.name", id)
+                     .list().getItems();
+@@ -186,7 +188,7 @@ public class KubernetesDiagnosticTools {
+ 
+     @Tool(description = "List deployments in a namespace with ready replicas and current image (like `kubectl get deployments`).")
+     public String listDeployments(@ToolParam(description = "Namespace to list deployments in") String namespace) {
+-        return call(() -> {
++        return call("listDeployments(" + namespace + ")", () -> {
+             List<Deployment> deployments = client.apps().deployments().inNamespace(namespace).list().getItems();
+             if (deployments.isEmpty()) {
+                 return "No deployments found in namespace " + namespace + ".";
+@@ -207,7 +209,7 @@ public class KubernetesDiagnosticTools {
+     @Tool(description = "Describe a deployment: strategy, conditions and rollout history (like `kubectl describe deployment` plus `kubectl rollout history`).")
+     public String describeDeployment(@ToolParam(description = "Deployment name") String deployment,
+                                      @ToolParam(description = "Namespace of the deployment") String namespace) {
+-        return call(() -> {
++        return call("describeDeployment(" + namespace + ", " + deployment + ")", () -> {
+             Deployment d = client.apps().deployments().inNamespace(namespace).withName(deployment).get();
+             if (d == null) {
+                 return notFound("Deployment", deployment, namespace);
+@@ -274,14 +276,31 @@ public class KubernetesDiagnosticTools {
+         });
+     }
+ 
+-    private String call(Supplier<String> action) {
++    /**
++     * Every tool call and its output since the last {@link #clearEvidence()}, for the root cause agent: the
++     * investigator only replies that it is done, so the evidence lives in these tool results.
++     */
++    public List<String> evidence() {
++        synchronized (evidence) {
++            return List.copyOf(evidence);
++        }
++    }
++
++    public void clearEvidence() {
++        evidence.clear();
++    }
++
++    private String call(String toolCall, Supplier<String> action) {
++        String result;
+         try {
+-            return action.get();
++            result = action.get();
+         } catch (KubernetesClientException e) {
+-            return "Error: Kubernetes API call failed (HTTP " + e.getCode() + "): " + e.getMessage();
++            result = "Error: Kubernetes API call failed (HTTP " + e.getCode() + "): " + e.getMessage();
+         } catch (RuntimeException e) {
+-            return "Error: " + e.getMessage();
++            result = "Error: " + e.getMessage();
+         }
++        evidence.add("### " + toolCall + "\n" + result);
++        return result;
+     }
+ 
+     private static String notFound(String kind, String name, String namespace) {
+diff --git a/src/main/java/com/ebcont/k8/triage/RootCauseAgent.java b/src/main/java/com/ebcont/k8/triage/RootCauseAgent.java
+new file mode 100644
+index 0000000..5807d96
+--- /dev/null
++++ b/src/main/java/com/ebcont/k8/triage/RootCauseAgent.java
+@@ -0,0 +1,38 @@
++package com.ebcont.k8.triage;
++
++import org.springframework.ai.chat.client.ChatClient;
++import org.springframework.stereotype.Component;
++
++import java.util.List;
++
++@Component
++public class RootCauseAgent {
++    public static String ROOT_CAUSE_PROMPT = """
++            You are a root cause analysis agent. You receive all evidence an investigator
++            collected from Kubernetes. Using only that evidence, write a short report: for each
++            unhealthy workload, give the symptom, the root cause with the evidence that proves it,
++            and a concrete fix. Say so if the evidence is insufficient.
++            """;
++
++    private static final String ROLLBACK_INSTRUCTIONS = """
++            For each finding, propose a rollback: pick the last revision in the deployment's rollout history that
++            ran without the offending change. Only recommend it if rolling back to that revision fixes the symptom.
++            """;
++
++    private final ChatClient chatClient;
++
++    public RootCauseAgent(ChatClient.Builder builder) {
++        this.chatClient = builder
++                .defaultSystem(ROOT_CAUSE_PROMPT + ROLLBACK_INSTRUCTIONS)
++                .build();
++    }
++
++    public RootCauseReport analyse(List<String> toolEvidence, String investigatorAnswer) {
++        String evidence = toolEvidence.isEmpty() ? "(no tool calls)" : String.join("\n\n", toolEvidence);
++        return chatClient.prompt()
++                .user("## Tool calls and their output\n\n" + evidence
++                        + "\n\n## Investigator's final message\n\n" + investigatorAnswer)
++                .call()
++                .entity(RootCauseReport.class);
++    }
++}
+diff --git a/src/main/java/com/ebcont/k8/triage/RootCauseReport.java b/src/main/java/com/ebcont/k8/triage/RootCauseReport.java
+new file mode 100644
+index 0000000..c1cc956
+--- /dev/null
++++ b/src/main/java/com/ebcont/k8/triage/RootCauseReport.java
+@@ -0,0 +1,66 @@
++package com.ebcont.k8.triage;
++
++import com.fasterxml.jackson.annotation.JsonPropertyDescription;
++
++import java.util.List;
++
++/** Structured output of the {@link RootCauseAgent}: one finding per unhealthy workload. */
++public record RootCauseReport(
++        @JsonPropertyDescription("One entry per unhealthy workload")
++        List<Finding> findings) {
++
++    public record Finding(
++            @JsonPropertyDescription("Namespace of the workload")
++            String namespace,
++            @JsonPropertyDescription("Deployment name")
++            String deployment,
++            @JsonPropertyDescription("Observed symptom, e.g. CrashLoopBackOff with the error from the logs")
++            String symptom,
++            @JsonPropertyDescription("Root cause, based only on the evidence")
++            String rootCause,
++            @JsonPropertyDescription("The change that introduced the problem")
++            OffendingChange offendingChange,
++            @JsonPropertyDescription("Quotes from the evidence (logs, events, rollout history) that prove the root cause")
++            List<String> evidence,
++            @JsonPropertyDescription("Concrete fix for the underlying problem")
++            String fix,
++            @JsonPropertyDescription("Proposed rollback; set recommended=false if a rollback would not help")
++            RollbackProposal rollback,
++            @JsonPropertyDescription("False if the evidence is insufficient to be confident about the root cause")
++            boolean evidenceSufficient) {
++    }
++
++    public record OffendingChange(
++            @JsonPropertyDescription("Where the change came from")
++            ChangeSource source,
++            @JsonPropertyDescription("Commit SHA for GitHub deployments, otherwise null")
++            String commit,
++            @JsonPropertyDescription("Author or user who made the change, if known")
++            String author,
++            @JsonPropertyDescription("Deployment revision that introduced the change")
++            Integer revision,
++            @JsonPropertyDescription("Change-cause annotation or other description of the change")
++            String description) {
++    }
++
++    public enum ChangeSource { GITHUB, MANUAL, UNKNOWN }
++
++    public record RollbackProposal(
++            @JsonPropertyDescription("True if rolling back resolves the incident")
++            boolean recommended,
++            @JsonPropertyDescription("Last healthy deployment revision to roll back to (from the rollout history)")
++            Integer toRevision,
++            @JsonPropertyDescription("Why this revision is safe to roll back to, or why a rollback would not help")
++            String reason) {
++    }
++
++    /** The `kubectl rollout undo` command for a recommended rollback, or null. */
++    public static String rollbackCommand(Finding finding) {
++        RollbackProposal rollback = finding.rollback();
++        if (rollback == null || !rollback.recommended() || rollback.toRevision() == null) {
++            return null;
++        }
++        return "kubectl rollout undo deployment/" + finding.deployment() + " -n " + finding.namespace()
++                + " --to-revision=" + rollback.toRevision();
++    }
++}
+diff --git a/src/main/java/com/ebcont/k8/triage/TriageRunner.java b/src/main/java/com/ebcont/k8/triage/TriageRunner.java
+index da80f20..df998d6 100644
+--- a/src/main/java/com/ebcont/k8/triage/TriageRunner.java
++++ b/src/main/java/com/ebcont/k8/triage/TriageRunner.java
+@@ -16,16 +16,47 @@ public class TriageRunner implements CommandLineRunner {
+     private static final Logger log = LoggerFactory.getLogger(TriageRunner.class);
+ 
+     private final InvestigatorAgent investigator;
++    private final RootCauseAgent rootCause;
++    private final KubernetesDiagnosticTools diagnosticTools;
+     private final List<String> namespaces;
+ 
+-    public TriageRunner(InvestigatorAgent investigator, @Value("${triage.namespaces}") List<String> namespaces) {
++    public TriageRunner(InvestigatorAgent investigator, RootCauseAgent rootCause,
++                        KubernetesDiagnosticTools diagnosticTools,
++                        @Value("${triage.namespaces}") List<String> namespaces) {
+         this.investigator = investigator;
++        this.rootCause = rootCause;
++        this.diagnosticTools = diagnosticTools;
+         this.namespaces = namespaces;
+     }
+ 
+     @Override
+     public void run(String... args) {
+         log.info("Starting investigation of namespaces {}", namespaces);
+-        log.info("Investigator: {}", investigator.investigate(namespaces));
++        diagnosticTools.clearEvidence();
++        String investigation = investigator.investigate(namespaces);
++        log.info("Investigator: {}", investigation);
++
++        List<String> evidence = diagnosticTools.evidence();
++        log.info("Running root cause analysis on {} tool results", evidence.size());
++        RootCauseReport report = rootCause.analyse(evidence, investigation);
++        for (RootCauseReport.Finding finding : report.findings()) {
++            log.info("""
++                            {}/{}
++                              Symptom:    {}
++                              Root cause: {}
++                              Change:     {}
++                              Evidence:   {}
++                              Fix:        {}
++                              Rollback:   {}""",
++                    finding.namespace(), finding.deployment(), finding.symptom(), finding.rootCause(),
++                    finding.offendingChange(), finding.evidence(), finding.fix(), formatRollback(finding));
++        }
++    }
++
++    private static String formatRollback(RootCauseReport.Finding finding) {
++        String command = RootCauseReport.rollbackCommand(finding);
++        String reason = finding.rollback() == null ? "" : " (" + finding.rollback().reason() + ")";
++        // Only proposed: nothing is rolled back automatically.
++        return (command != null ? "proposed: " + command : "not recommended") + reason;
+     }
+ }
+diff --git a/src/test/resources/root-cause-answer.json b/src/test/resources/root-cause-answer.json
+new file mode 100644
+index 0000000..f89d866
+--- /dev/null
++++ b/src/test/resources/root-cause-answer.json
+@@ -0,0 +1,83 @@
++{
++  "findings": [
++    {
++      "namespace": "default",
++      "deployment": "api",
++      "symptom": "Pod fails to start with ImagePullBackOff; Deployment reports ProgressDeadlineExceeded.",
++      "rootCause": "The image reference \"registry.invalid/api:latestt\" cannot be resolved because the registry hostname does not exist, causing image pull failures.",
++      "offendingChange": {
++        "source": "MANUAL",
++        "commit": null,
++        "author": "jdoe",
++        "revision": 2,
++        "description": "manual: kubectl set image by jdoe"
++      },
++      "evidence": [
++        "State: Waiting (ImagePullBackOff) ... failed to resolve reference \"registry.invalid/api:latestt\": ... no such host",
++        "Failed to pull image \"registry.invalid/api:latestt\": ... lookup registry.invalid on 172.22.0.1:53: no such host",
++        "Progressing=False (ProgressDeadlineExceeded: ReplicaSet \"api-75854b6bd\" has timed out progressing.)",
++        "change-cause=manual: kubectl set image by jdoe"
++      ],
++      "fix": "Update the Deployment to use a valid, reachable image reference (e.g., correct registry hostname and tag) and apply the change.",
++      "rollback": {
++        "recommended": true,
++        "toRevision": 1,
++        "reason": "Revision 1 used a known good image (busybox:1.37) and was healthy; rolling back will restore a deployable image."
++      },
++      "evidenceSufficient": true
++    },
++    {
++      "namespace": "default",
++      "deployment": "web",
++      "symptom": "Pod repeatedly crashes with exit code 1, entering CrashLoopBackOff; logs show missing DATABASE_URL env var.",
++      "rootCause": "Container exits because required environment variable DATABASE_URL is not set.",
++      "offendingChange": {
++        "source": "GITHUB",
++        "commit": "e4f5a6b",
++        "author": "github-actions",
++        "revision": 2,
++        "description": "github-actions: deploy e4f5a6b"
++      },
++      "evidence": [
++        "State: Waiting (CrashLoopBackOff) ... exitCode=1",
++        "FATAL: environment variable DATABASE_URL is required",
++        "Back-off restarting failed container web",
++        "change-cause=github-actions: deploy e4f5a6b"
++      ],
++      "fix": "Add the required environment variable DATABASE_URL to the Deployment spec (e.g., under spec.template.spec.containers.env) and redeploy.",
++      "rollback": {
++        "recommended": false,
++        "toRevision": null,
++        "reason": "Both revisions use the same image and no prior revision is known to provide DATABASE_URL; rolling back will not resolve the missing variable."
++      },
++      "evidenceSufficient": true
++    },
++    {
++      "namespace": "default",
++      "deployment": "worker",
++      "symptom": "Pod is killed by OOM, then enters CrashLoopBackOff; memory limit set to 32Mi.",
++      "rootCause": "The container exceeds its 32Mi memory limit, causing OOMKilled termination.",
++      "offendingChange": {
++        "source": "GITHUB",
++        "commit": "7f6e5d4",
++        "author": "github-actions",
++        "revision": 2,
++        "description": "github-actions: deploy 7f6e5d4"
++      },
++      "evidence": [
++        "State: Waiting (CrashLoopBackOff) ... OOMKilled, exitCode=137",
++        "Last State: Terminated (reason=OOMKilled, exitCode=137)",
++        "Processing batch 1/50 (loading all rows)...",
++        "memory=32Mi",
++        "change-cause=github-actions: deploy 7f6e5d4"
++      ],
++      "fix": "Increase the memory limit for the worker container (e.g., to 128Mi) or optimise the workload to stay within the current limit.",
++      "rollback": {
++        "recommended": false,
++        "toRevision": null,
++        "reason": "Previous revision also used the same image and resources; rolling back is unlikely to prevent OOM termination."
++      },
++      "evidenceSufficient": true
++    }
++  ]
++}
+-- 
+2.53.0
+

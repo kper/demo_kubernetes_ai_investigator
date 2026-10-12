@@ -1,0 +1,407 @@
+From 029c8ba59b4861bfaef42b224804dd7013adf809 Mon Sep 17 00:00:00 2001
+From: Kevin Per <kevin.per@ebcont.com>
+Date: Mon, 12 Oct 2026 09:38:15 +0200
+Subject: [PATCH 5/7] Added investigator tests
+
+---
+ build.gradle                                  |  19 ++-
+ scripts/cluster-down.sh                       |   2 +-
+ scripts/cluster-up.sh                         |   5 +-
+ .../ebcont/k8/triage/InvestigatorAgentIT.java |  68 ++++++++
+ .../k8/triage/KindClusterExtension.java       |  74 ++++++++
+ src/test/resources/investigator-answer.md     | 159 ++++++++++++++++++
+ 6 files changed, 323 insertions(+), 4 deletions(-)
+ create mode 100644 src/test/java/com/ebcont/k8/triage/InvestigatorAgentIT.java
+ create mode 100644 src/test/java/com/ebcont/k8/triage/KindClusterExtension.java
+ create mode 100644 src/test/resources/investigator-answer.md
+
+diff --git a/build.gradle b/build.gradle
+index 3d6fd4f..33305a6 100644
+--- a/build.gradle
++++ b/build.gradle
+@@ -37,5 +37,22 @@ dependencyManagement {
+ }
+ 
+ tasks.named('test') {
+-	useJUnitPlatform()
++	useJUnitPlatform {
++		excludeTags 'cluster'
++	}
++}
++
++// Tests tagged "cluster" create a new kind cluster per test (scripts/cluster-up.sh): needs docker, kind and kubectl,
++// and takes a few minutes per test.
++tasks.register('clusterTest', Test) {
++	description = 'Runs the tests against a fresh kind cluster per test.'
++	group = 'verification'
++	testClassesDirs = sourceSets.test.output.classesDirs
++	classpath = sourceSets.test.runtimeClasspath
++	useJUnitPlatform {
++		includeTags 'cluster'
++	}
++	testLogging {
++		events 'started', 'passed', 'failed', 'skipped'
++	}
+ }
+diff --git a/scripts/cluster-down.sh b/scripts/cluster-down.sh
+index edfba36..3f9c3af 100755
+--- a/scripts/cluster-down.sh
++++ b/scripts/cluster-down.sh
+@@ -9,5 +9,5 @@ cd "$(dirname "$0")/.."
+ CLUSTER=${KIND_DEV_CLUSTER_NAME:-k8-triage-dev}
+ 
+ kind delete cluster --name "$CLUSTER"
+-rm -f .cache/kind-dev.kubeconfig
++rm -f "${KIND_DEV_KUBECONFIG:-.cache/kind-dev.kubeconfig}"
+ echo "Deleted kind cluster $CLUSTER"
+diff --git a/scripts/cluster-up.sh b/scripts/cluster-up.sh
+index abe2437..dae0a91 100755
+--- a/scripts/cluster-up.sh
++++ b/scripts/cluster-up.sh
+@@ -4,6 +4,7 @@
+ #
+ #   scripts/cluster-up.sh
+ #   KIND_DEV_CLUSTER_NAME=my-cluster scripts/cluster-up.sh
++#   KIND_DEV_CLUSTER_NAME=my-cluster KIND_DEV_KUBECONFIG=/tmp/my.kubeconfig scripts/cluster-up.sh
+ #
+ # Then:
+ #   KUBECONFIG=.cache/kind-dev.kubeconfig ./gradlew bootRun --args='--triage.run=true'
+@@ -12,14 +13,14 @@ set -x
+ cd "$(dirname "$0")/.."
+ 
+ CLUSTER=${KIND_DEV_CLUSTER_NAME:-k8-triage-dev}
+-export KUBECONFIG=$PWD/.cache/kind-dev.kubeconfig
++export KUBECONFIG=${KIND_DEV_KUBECONFIG:-$PWD/.cache/kind-dev.kubeconfig}
+ 
+ for tool in docker kind kubectl; do
+   command -v "$tool" >/dev/null || { echo "error: $tool is not installed" >&2; exit 1; }
+ done
+ 
+ echo "==> Creating kind cluster $CLUSTER"
+-mkdir -p .cache
++mkdir -p "$(dirname "$KUBECONFIG")"
+ if kind get clusters | grep -qx "$CLUSTER"; then
+   kind delete cluster --name "$CLUSTER"
+ fi
+diff --git a/src/test/java/com/ebcont/k8/triage/InvestigatorAgentIT.java b/src/test/java/com/ebcont/k8/triage/InvestigatorAgentIT.java
+new file mode 100644
+index 0000000..20c2d5b
+--- /dev/null
++++ b/src/test/java/com/ebcont/k8/triage/InvestigatorAgentIT.java
+@@ -0,0 +1,68 @@
++package com.ebcont.k8.triage;
++
++import io.fabric8.kubernetes.client.KubernetesClient;
++import org.junit.jupiter.api.Tag;
++import org.junit.jupiter.api.Test;
++import org.junit.jupiter.api.extension.ExtendWith;
++import org.mockito.ArgumentCaptor;
++import org.springframework.ai.chat.client.ChatClient;
++
++import java.io.IOException;
++import java.io.InputStream;
++import java.nio.charset.StandardCharsets;
++import java.util.List;
++
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.ArgumentMatchers.anyString;
++import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.when;
++
++/**
++ * Runs the investigator with a mocked {@link ChatClient} that returns a static answer (investigator-answer.md,
++ * a recorded gpt-oss run) against a new kind cluster per test.
++ */
++@Tag("cluster")
++@ExtendWith(KindClusterExtension.class)
++class InvestigatorAgentIT {
++
++    private final ChatClient.Builder builder = mock(ChatClient.Builder.class);
++    private final ChatClient chatClient = mock(ChatClient.class);
++    private final ChatClient.ChatClientRequestSpec request = mock(ChatClient.ChatClientRequestSpec.class);
++    private final ChatClient.CallResponseSpec response = mock(ChatClient.CallResponseSpec.class);
++
++    @Test
++    void staticAnswerMatchesTheCluster(KubernetesClient client) throws IOException {
++        KubernetesDiagnosticTools tools = new KubernetesDiagnosticTools(client, 200);
++        stubChatClient(staticAnswer());
++
++        String answer = new InvestigatorAgent(builder, tools).investigate(List.of("default"));
++
++        String api = tools.describeDeployment("api", "default");
++        String web = tools.describeDeployment("web", "default");
++        String worker = tools.describeDeployment("worker", "default");
++        assertThat(answer).contains("registry.invalid/api:latestt", "manual: kubectl set image by jdoe");
++        assertThat(api).contains("registry.invalid/api:latestt", "manual: kubectl set image by jdoe");
++        assertThat(answer).contains("github-actions: deploy e4f5a6b", "DATABASE_URL");
++        assertThat(web).contains("github-actions: deploy e4f5a6b");
++        assertThat(answer).contains("github-actions: deploy 7f6e5d4", "memory=32Mi");
++        assertThat(worker).contains("github-actions: deploy 7f6e5d4", "memory=32Mi");
++    }
++
++    private void stubChatClient(String answer) {
++        when(builder.defaultSystem(anyString())).thenReturn(builder);
++        when(builder.defaultTools(any())).thenReturn(builder);
++        when(builder.build()).thenReturn(chatClient);
++        when(chatClient.prompt()).thenReturn(request);
++        when(request.user(anyString())).thenReturn(request);
++        when(request.call()).thenReturn(response);
++        when(response.content()).thenReturn(answer);
++    }
++
++    private static String staticAnswer() throws IOException {
++        try (InputStream in = InvestigatorAgentIT.class.getResourceAsStream("/investigator-answer.md")) {
++            return new String(in.readAllBytes(), StandardCharsets.UTF_8);
++        }
++    }
++}
+diff --git a/src/test/java/com/ebcont/k8/triage/KindClusterExtension.java b/src/test/java/com/ebcont/k8/triage/KindClusterExtension.java
+new file mode 100644
+index 0000000..ab6fb39
+--- /dev/null
++++ b/src/test/java/com/ebcont/k8/triage/KindClusterExtension.java
+@@ -0,0 +1,74 @@
++package com.ebcont.k8.triage;
++
++import io.fabric8.kubernetes.client.Config;
++import io.fabric8.kubernetes.client.KubernetesClient;
++import io.fabric8.kubernetes.client.KubernetesClientBuilder;
++import org.junit.jupiter.api.extension.AfterEachCallback;
++import org.junit.jupiter.api.extension.BeforeEachCallback;
++import org.junit.jupiter.api.extension.ExtensionContext;
++import org.junit.jupiter.api.extension.ParameterContext;
++import org.junit.jupiter.api.extension.ParameterResolver;
++
++import java.io.IOException;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.util.concurrent.TimeUnit;
++
++/**
++ * Creates a fresh kind cluster with the broken workloads (scripts/cluster-up.sh) before each test and deletes it
++ * (scripts/cluster-down.sh) afterwards. Tests get a {@link KubernetesClient} for that cluster as a parameter.
++ * Uses its own cluster name and kubeconfig, so the dev cluster from scripts/cluster-up.sh is left alone.
++ * Script output goes to build/kind-test-cluster.log.
++ */
++public class KindClusterExtension implements BeforeEachCallback, AfterEachCallback, ParameterResolver {
++
++    static final String CLUSTER = "k8-triage-test";
++    private static final Path KUBECONFIG = Path.of("build/kind-test.kubeconfig").toAbsolutePath();
++    private static final Path LOG = Path.of("build/kind-test-cluster.log").toAbsolutePath();
++    private static final ExtensionContext.Namespace NAMESPACE = ExtensionContext.Namespace.create(KindClusterExtension.class);
++
++    @Override
++    public void beforeEach(ExtensionContext context) throws Exception {
++        runScript("scripts/cluster-up.sh", 10);
++        KubernetesClient client = new KubernetesClientBuilder()
++                .withConfig(Config.fromKubeconfig(Files.readString(KUBECONFIG)))
++                .build();
++        context.getStore(NAMESPACE).put(KubernetesClient.class, client);
++    }
++
++    @Override
++    public void afterEach(ExtensionContext context) throws Exception {
++        KubernetesClient client = context.getStore(NAMESPACE).remove(KubernetesClient.class, KubernetesClient.class);
++        if (client != null) {
++            client.close();
++        }
++        runScript("scripts/cluster-down.sh", 2);
++    }
++
++    @Override
++    public boolean supportsParameter(ParameterContext parameterContext, ExtensionContext extensionContext) {
++        return parameterContext.getParameter().getType() == KubernetesClient.class;
++    }
++
++    @Override
++    public Object resolveParameter(ParameterContext parameterContext, ExtensionContext extensionContext) {
++        return extensionContext.getStore(NAMESPACE).get(KubernetesClient.class, KubernetesClient.class);
++    }
++
++    private static void runScript(String script, long timeoutMinutes) throws IOException, InterruptedException {
++        Files.createDirectories(LOG.getParent());
++        ProcessBuilder builder = new ProcessBuilder("sh", script)
++                .redirectErrorStream(true)
++                .redirectOutput(ProcessBuilder.Redirect.appendTo(LOG.toFile()));
++        builder.environment().put("KIND_DEV_CLUSTER_NAME", CLUSTER);
++        builder.environment().put("KIND_DEV_KUBECONFIG", KUBECONFIG.toString());
++        Process process = builder.start();
++        if (!process.waitFor(timeoutMinutes, TimeUnit.MINUTES)) {
++            process.destroyForcibly();
++            throw new IllegalStateException(script + " timed out after " + timeoutMinutes + " min, see " + LOG);
++        }
++        if (process.exitValue() != 0) {
++            throw new IllegalStateException(script + " failed with exit code " + process.exitValue() + ", see " + LOG);
++        }
++    }
++}
+diff --git a/src/test/resources/investigator-answer.md b/src/test/resources/investigator-answer.md
+new file mode 100644
+index 0000000..702e641
+--- /dev/null
++++ b/src/test/resources/investigator-answer.md
+@@ -0,0 +1,159 @@
++Now compile findings.**Investigated namespace:** `default`
++
++**Summary of unhealthy workloads**
++
++| Workload | Kind | Current Status | Reason / Symptoms | Owner | Recent Image | Last Rollout Revision | Change‑Cause |
++|----------|------|----------------|-------------------|-------|--------------|----------------------|--------------|
++| `api` | Deployment | 0/1 pods ready | **ImagePullBackOff** (registry host not resolvable) | `ReplicaSet/api-75854b6bd` | `registry.invalid/api:latestt` (typo / invalid registry) | Rev 2 | `manual: kubectl set image by jdoe` |
++| `web` | Deployment | 0/1 pods ready | **CrashLoopBackOff** – container exits immediately with error | `ReplicaSet/web-564f7688c4` | `busybox:1.37` | Rev 2 | `github-actions: deploy e4f5a6b` |
++| `worker` | Deployment | 0/1 pods ready | **CrashLoopBackOff** – OOMKilled then restart loop | `ReplicaSet/worker-5d745c6779` | `busybox:1.37` (memory limit 32 Mi) | Rev 2 | `github-actions: deploy 7f6e5d4` |
++
++---
++
++## Detailed evidence per workload
++
++### 1. `api` Deployment
++
++**Pod:** `api-75854b6bd-vljcp`
++
++* **Describe output** – container `api` is in *Waiting* state with `ImagePullBackOff`.
++  ```
++  Image: registry.invalid/api:latestt
++  State: Waiting (reason=ImagePullBackOff, message=Back-off pulling image ...)
++  ```
++
++* **Events** – repeated pull attempts, DNS lookup failure for `registry.invalid`, then back‑off.
++
++  ```
++  07:18:55  Warning  Failed      failed to pull image "registry.invalid/api:latestt"
++  07:21:04  Warning  Failed      Error: ImagePullBackOff
++  07:21:17  Normal   BackOff     Back-off pulling image ...
++  ```
++
++* **Logs** – not available (container never started).
++
++* **Deployment description**
++
++  * Revision 2 uses the problematic image (`registry.invalid/api:latestt`).
++  * Change‑cause flagged as a **manual** `kubectl set image` by user `jdoe`.
++  * No health‑check failures reported; rollout condition *Progressing* is true because ReplicaSet is being created, but **available** pods remain 0.
++
++* **Rollout history**
++
++  ```
++  REV 1 – replicaset api-7db8b7dd6b – image busybox:1.37 – change-cause: github-actions: deploy 5a4b3c2
++  REV 2 – replicaset api-75854b6bd – image registry.invalid/api:latestt – change-cause: manual: kubectl set image by jdoe
++  ```
++
++---
++
++### 2. `web` Deployment
++
++**Pod:** `web-564f7688c4-bqzxj`
++
++* **Describe output** – container `web` is in *Waiting* with `CrashLoopBackOff`. Last termination was `Error` (exitCode 1).
++
++* **Events**
++
++  ```
++  Pulled   Container image "busybox:1.37" already present
++  Created  Created container: web
++  Started  Started container web
++  Warning  BackOff  back-off 5m0s restarting failed container web
++  ```
++
++* **Logs (current & previous instance)**
++
++  ```
++  Starting web server...
++  FATAL: environment variable DATABASE_URL is required
++  ```
++
++  Same message appears on each restart (6 restarts).
++
++* **Deployment description**
++
++  * Revision 2 (current) still uses `busybox:1.37`.
++  * Change‑cause: `github-actions: deploy e4f5a6b`.
++  * No config (env vars) present in pod spec – missing `DATABASE_URL`.
++
++* **Rollout history**
++
++  ```
++  REV 1 – replicaset web-6fc5655448 – image busybox:1.37 – change-cause: github-actions: deploy a1b2c3d
++  REV 2 – replicaset web-564f7688c4 – image busybox:1.37 – change-cause: github-actions: deploy e4f5a6b
++  ```
++
++---
++
++### 3. `worker` Deployment
++
++**Pod:** `worker-5d745c6779-z55mp`
++
++* **Describe output** – container `worker` is in *Waiting* with `CrashLoopBackOff`. Last termination was `OOMKilled` (exitCode 137).
++
++* **Events**
++
++  ```
++  BackOff  back-off 5m0s restarting failed container worker
++  Pulled   Container image "busybox:1.37" already present
++  Created  Created container: worker
++  Started  Started container worker
++  ```
++
++* **Logs (current & previous instance)**
++
++  ```
++  Processing batch 1/50 (loading all rows)...
++  ```
++
++  No apparent error in stdout; OOMKilled suggests the container exceeded its memory limit.
++
++* **Deployment description**
++
++  * Image: `busybox:1.37`.
++  * Container requests **none**, limits **memory=32Mi**.
++  * Change‑cause: `github-actions: deploy 7f6e5d4`.
++
++* **Rollout history**
++
++  ```
++  REV 1 – replicaset worker-547c5498f9 – image busybox:1.37 – change-cause: github-actions: deploy 0c9d8e7
++  REV 2 – replicaset worker-5d745c6779 – image busybox:1.37 – change-cause: github-actions: deploy 7f6e5d4
++  ```
++
++---
++
++## Additional observations
++
++* The **`api`** deployment change was performed manually (not via CI). The image reference contains both a typo in the tag (`latestt`) and an invalid registry hostname, leading to DNS failure.
++
++* The **`web`** deployment lacks the required environment variable `DATABASE_URL`. The pod spec shows no environment entries, yet the application expects it, causing immediate exit with code 1.
++
++* The **`worker`** deployment sets a hard memory limit of **32 Mi** but the workload appears to need more memory (OOMKilled on each start). No resource requests are defined, which may cause the scheduler to place the pod on a node with insufficient memory headroom.
++
++* All three problematic deployments have a **revision 2** rollout that introduced the issue, while revision 1 (previous successful rollout) used a generic `busybox:1.37` image for `web` and `worker` and a valid image for `api` (presumably `busybox:1.37` from the prior revision).
++
++* No recent events indicate node‑level problems (e.g., node pressure) – failures are localized to the containers themselves.
++
++---
++
++### Evidence collected (for hand‑off to root‑cause analysis)
++
++| Resource | Command | Output reference |
++|----------|---------|------------------|
++| Pods list | `listPods(default)` | Returned list with unhealthy pods highlighted |
++| Deployments list | `listDeployments(default)` | Shows current replica counts and images |
++| `api` pod description | `describePod(default, api-75854b6bd-vljcp)` | Included above |
++| `api` pod events | `getPodEvents(default, api-75854b6bd-vljcp)` | Included above |
++| `api` deployment description & rollout | `describeDeployment(default, api)` | Included above |
++| `web` pod description | `describePod(default, web-564f7688c4-bqzxj)` | Included above |
++| `web` pod logs | `getPodLogs(default, web-564f7688c4-bqzxj)` | Included above |
++| `web` pod events | `getPodEvents(default, web-564f7688c4-bqzxj)` | Included above |
++| `web` deployment description & rollout | `describeDeployment(default, web)` | Included above |
++| `worker` pod description | `describePod(default, worker-5d745c6779-z55mp)` | Included above |
++| `worker` pod logs | `getPodLogs(default, worker-5d745c6779-z55mp)` | Included above |
++| `worker` pod events | `getPodEvents(default, worker-5d745c6779-z55mp)` | Included above |
++| `worker` deployment description & rollout | `describeDeployment(default, worker)` | Included above |
++
++These artifacts should provide the root‑cause analysis agent with everything needed to determine why the `api`, `web`, and `worker` workloads are unhealthy and to recommend remediation steps.
+-- 
+2.53.0
+

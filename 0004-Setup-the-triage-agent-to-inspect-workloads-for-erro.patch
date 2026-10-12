@@ -1,0 +1,301 @@
+From 871040f71f9b49f97a5271ab3bd0962b1afa5701 Mon Sep 17 00:00:00 2001
+From: Kevin Per <kevin.per@ebcont.com>
+Date: Mon, 12 Oct 2026 09:24:19 +0200
+Subject: [PATCH 4/7] Setup the triage agent to inspect workloads for errors
+
+---
+ .gitignore                                    |  2 +
+ build.gradle                                  |  1 +
+ k8s/workloads/broken.yaml                     | 57 ++++++++++++++
+ k8s/workloads/healthy.yaml                    | 74 +++++++++++++++++++
+ scripts/cluster-down.sh                       | 13 ++++
+ scripts/cluster-up.sh                         | 54 ++++++++++++++
+ .../ebcont/k8/triage/InvestigatorAgent.java   |  2 -
+ .../k8/triage/KubernetesDiagnosticTools.java  | 10 +--
+ 8 files changed, 202 insertions(+), 11 deletions(-)
+ create mode 100644 k8s/workloads/broken.yaml
+ create mode 100644 k8s/workloads/healthy.yaml
+ create mode 100755 scripts/cluster-down.sh
+ create mode 100755 scripts/cluster-up.sh
+
+diff --git a/.gitignore b/.gitignore
+index c2065bc..6ca7dc3 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -35,3 +35,5 @@ out/
+ 
+ ### VS Code ###
+ .vscode/
++
++.cache/
+diff --git a/build.gradle b/build.gradle
+index 1eee676..3d6fd4f 100644
+--- a/build.gradle
++++ b/build.gradle
+@@ -25,6 +25,7 @@ dependencies {
+ 	implementation 'org.springframework.ai:spring-ai-starter-model-bedrock-converse'
+ 	implementation 'org.springframework.boot:spring-boot-starter-jackson'
+ 	implementation 'io.fabric8:kubernetes-client:7.9.0'
++	runtimeOnly 'software.amazon.awssdk:signin:2.51.2'
+ 	testImplementation 'org.springframework.boot:spring-boot-starter-test'
+ 	testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+ }
+diff --git a/k8s/workloads/broken.yaml b/k8s/workloads/broken.yaml
+new file mode 100644
+index 0000000..e334b0e
+--- /dev/null
++++ b/k8s/workloads/broken.yaml
+@@ -0,0 +1,57 @@
++# Revision 2: the broken rollouts the agent has to find. RollingUpdate keeps the old revision-1 pod serving.
++# commit e4f5a6b removed DATABASE_URL -> CrashLoopBackOff
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: web
++  labels: {app: web}
++  annotations: {kubernetes.io/change-cause: "github-actions: deploy e4f5a6b"}
++spec:
++  replicas: 1
++  selector: {matchLabels: {app: web}}
++  template:
++    metadata: {labels: {app: web}}
++    spec:
++      terminationGracePeriodSeconds: 1
++      containers:
++        - name: web
++          image: busybox:1.37
++          command: ["sh", "-c", "echo 'Starting web server...'; if [ -z \"$DATABASE_URL\" ]; then echo 'FATAL: environment variable DATABASE_URL is required'; exit 1; fi; sleep 3600"]
++---
++# commit 7f6e5d4 loads everything into memory and cuts the limit -> OOMKilled
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: worker
++  labels: {app: worker}
++  annotations: {kubernetes.io/change-cause: "github-actions: deploy 7f6e5d4"}
++spec:
++  replicas: 1
++  selector: {matchLabels: {app: worker}}
++  template:
++    metadata: {labels: {app: worker}}
++    spec:
++      terminationGracePeriodSeconds: 1
++      containers:
++        - name: worker
++          image: busybox:1.37
++          command: ["sh", "-c", "echo 'Processing batch 1/50 (loading all rows)...'; tail /dev/zero"]
++          resources: {limits: {memory: 32Mi}}
++---
++# a manual `kubectl set image` with a typo'd tag -> ImagePullBackOff
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: api
++  labels: {app: api}
++  annotations: {kubernetes.io/change-cause: "manual: kubectl set image by jdoe"}
++spec:
++  replicas: 1
++  selector: {matchLabels: {app: api}}
++  template:
++    metadata: {labels: {app: api}}
++    spec:
++      terminationGracePeriodSeconds: 1
++      containers:
++        - name: api
++          image: registry.invalid/api:latestt
+diff --git a/k8s/workloads/healthy.yaml b/k8s/workloads/healthy.yaml
+new file mode 100644
+index 0000000..578d536
+--- /dev/null
++++ b/k8s/workloads/healthy.yaml
+@@ -0,0 +1,74 @@
++# Revision 1 of each workload: healthy. The change-causes reference the commits in main.py's mock GitHub data.
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: web
++  labels: {app: web}
++  annotations: {kubernetes.io/change-cause: "github-actions: deploy a1b2c3d"}
++spec:
++  replicas: 1
++  selector: {matchLabels: {app: web}}
++  template:
++    metadata: {labels: {app: web}}
++    spec:
++      terminationGracePeriodSeconds: 1
++      containers:
++        - name: web
++          image: busybox:1.37
++          env: [{name: DATABASE_URL, value: "postgres://web-db:5432/web"}]
++          command: ["sh", "-c", "echo 'Starting web server...'; [ -n \"$DATABASE_URL\" ] || exit 1; echo 'Listening on :8080'; sleep 3600"]
++---
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: worker
++  labels: {app: worker}
++  annotations: {kubernetes.io/change-cause: "github-actions: deploy 0c9d8e7"}
++spec:
++  replicas: 1
++  selector: {matchLabels: {app: worker}}
++  template:
++    metadata: {labels: {app: worker}}
++    spec:
++      terminationGracePeriodSeconds: 1
++      containers:
++        - name: worker
++          image: busybox:1.37
++          command: ["sh", "-c", "echo 'Processing batches (streaming)...'; sleep 3600"]
++          resources: {limits: {memory: 256Mi}}
++---
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: api
++  labels: {app: api}
++  annotations: {kubernetes.io/change-cause: "github-actions: deploy 5a4b3c2"}
++spec:
++  replicas: 1
++  selector: {matchLabels: {app: api}}
++  template:
++    metadata: {labels: {app: api}}
++    spec:
++      terminationGracePeriodSeconds: 1
++      containers:
++        - name: api
++          image: busybox:1.37
++          command: ["sh", "-c", "echo 'GET /healthz 200'; sleep 3600"]
++---
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: cache
++  labels: {app: cache}
++  annotations: {kubernetes.io/change-cause: "github-actions: deploy 9e8d7c6"}
++spec:
++  replicas: 1
++  selector: {matchLabels: {app: cache}}
++  template:
++    metadata: {labels: {app: cache}}
++    spec:
++      terminationGracePeriodSeconds: 1
++      containers:
++        - name: cache
++          image: busybox:1.37
++          command: ["sh", "-c", "echo 'Ready to accept connections'; sleep 3600"]
+diff --git a/scripts/cluster-down.sh b/scripts/cluster-down.sh
+new file mode 100755
+index 0000000..edfba36
+--- /dev/null
++++ b/scripts/cluster-down.sh
+@@ -0,0 +1,13 @@
++#!/bin/sh
++# Delete the kind cluster created by scripts/cluster-up.sh and its kubeconfig.
++#
++#   scripts/cluster-down.sh
++#   KIND_DEV_CLUSTER_NAME=my-cluster scripts/cluster-down.sh
++set -eu
++cd "$(dirname "$0")/.."
++
++CLUSTER=${KIND_DEV_CLUSTER_NAME:-k8-triage-dev}
++
++kind delete cluster --name "$CLUSTER"
++rm -f .cache/kind-dev.kubeconfig
++echo "Deleted kind cluster $CLUSTER"
+diff --git a/scripts/cluster-up.sh b/scripts/cluster-up.sh
+new file mode 100755
+index 0000000..abe2437
+--- /dev/null
++++ b/scripts/cluster-up.sh
+@@ -0,0 +1,54 @@
++#!/bin/sh
++# Create a kind cluster with the broken workloads the agent has to triage.
++# Recreates the cluster if it already exists. Remove it with scripts/cluster-down.sh.
++#
++#   scripts/cluster-up.sh
++#   KIND_DEV_CLUSTER_NAME=my-cluster scripts/cluster-up.sh
++#
++# Then:
++#   KUBECONFIG=.cache/kind-dev.kubeconfig ./gradlew bootRun --args='--triage.run=true'
++set -eu
++set -x
++cd "$(dirname "$0")/.."
++
++CLUSTER=${KIND_DEV_CLUSTER_NAME:-k8-triage-dev}
++export KUBECONFIG=$PWD/.cache/kind-dev.kubeconfig
++
++for tool in docker kind kubectl; do
++  command -v "$tool" >/dev/null || { echo "error: $tool is not installed" >&2; exit 1; }
++done
++
++echo "==> Creating kind cluster $CLUSTER"
++mkdir -p .cache
++if kind get clusters | grep -qx "$CLUSTER"; then
++  kind delete cluster --name "$CLUSTER"
++fi
++kind create cluster --name "$CLUSTER" --kubeconfig "$KUBECONFIG" --wait 180s
++
++echo "==> Deploying the workloads: revision 1 healthy, then revision 2 broken"
++kubectl apply -f k8s/workloads/healthy.yaml
++kubectl rollout status deployment --timeout=180s
++kubectl apply -f k8s/workloads/broken.yaml
++
++# Wait until each broken workload shows its failure (current or last container state).
++# An OOM kill is sometimes recorded as reason "Error" (containerd misses the OOM event), so exit code 137 counts too.
++states='{range .items[*].status.containerStatuses[*]}{.state.waiting.reason} {.state.terminated.reason} {.lastState.terminated.reason} exit={.lastState.terminated.exitCode} {end}'
++deadline=$(($(date +%s) + 300))
++for expected in "web CrashLoopBackOff" "worker OOMKilled|exit=137" "api ImagePullBackOff|ErrImagePull"; do
++  app=${expected%% *}
++  reason=${expected#* }
++  until kubectl get pods -l "app=$app" -o jsonpath="$states" | grep -qE "$reason"; do
++    if [ "$(date +%s)" -gt "$deadline" ]; then
++      echo "error: $app did not reach $reason" >&2
++      kubectl get pods -l "app=$app" >&2
++      exit 1
++    fi
++    sleep 3
++  done
++  echo "    $app: $reason"
++done
++
++kubectl get deployments,pods
++echo
++echo "Ready. Kubeconfig: $KUBECONFIG"
++echo "  KUBECONFIG=$KUBECONFIG ./gradlew bootRun --args='--triage.run=true'"
+diff --git a/src/main/java/com/ebcont/k8/triage/InvestigatorAgent.java b/src/main/java/com/ebcont/k8/triage/InvestigatorAgent.java
+index 8c72587..a7f2364 100644
+--- a/src/main/java/com/ebcont/k8/triage/InvestigatorAgent.java
++++ b/src/main/java/com/ebcont/k8/triage/InvestigatorAgent.java
+@@ -11,8 +11,6 @@ public class InvestigatorAgent {
+     private final ChatClient chatClient;
+ 
+     public InvestigatorAgent(ChatClient.Builder builder, KubernetesDiagnosticTools diagnosticTools) {
+-        // Spring AI runs the tool-call loop internally: each @Tool call is executed and fed back
+-        // to the model until it returns a final answer.
+         this.chatClient = builder
+                 .defaultSystem(KubernetesDiagnosticTools.INVESTIGATOR_PROMPT)
+                 .defaultTools(diagnosticTools)
+diff --git a/src/main/java/com/ebcont/k8/triage/KubernetesDiagnosticTools.java b/src/main/java/com/ebcont/k8/triage/KubernetesDiagnosticTools.java
+index 098b286..6acce92 100644
+--- a/src/main/java/com/ebcont/k8/triage/KubernetesDiagnosticTools.java
++++ b/src/main/java/com/ebcont/k8/triage/KubernetesDiagnosticTools.java
+@@ -34,15 +34,7 @@ public class KubernetesDiagnosticTools {
+             and events, its Kubernetes deployment and rollout history, and the matching GitHub repo's recent
+             deployments and commit diffs. Changes made outside GitHub (e.g. manual kubectl edits) are also
+             possible. Do not diagnose: a separate root cause agent will analyse everything you collect.
+-            When you have gathered enough evidence, reply with one line saying you are done.
+-            """;
+-
+-    public static String ROOT_CAUSE_PROMPT = """
+-            You are a root cause analysis agent. You receive all evidence an investigator
+-            collected from Kubernetes and GitHub. Using only that evidence, write a short report: for each
+-            unhealthy workload, give the symptom, the root cause, the offending change (commit/author or
+-            manual edit) with the evidence that proves it, and a concrete fix. Say so if the evidence is
+-            insufficient.
++            When you have gathered enough evidence, reply with relevant findings.
+             """;
+ 
+     private static final String REVISION_ANNOTATION = "deployment.kubernetes.io/revision";
+-- 
+2.53.0
+

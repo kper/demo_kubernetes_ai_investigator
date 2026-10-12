@@ -1,0 +1,118 @@
+From 64c920fbe648ba1ae0c096b9ae25f454c52b81e6 Mon Sep 17 00:00:00 2001
+From: Kevin Per <kevin.per@ebcont.com>
+Date: Mon, 12 Oct 2026 09:11:58 +0200
+Subject: [PATCH 3/7] Setup investigator agent
+
+---
+ build.gradle                                  |  2 +-
+ .../ebcont/k8/triage/InvestigatorAgent.java   | 28 +++++++++++++++++
+ .../com/ebcont/k8/triage/TriageRunner.java    | 31 +++++++++++++++++++
+ src/main/resources/application.properties     |  9 ++++++
+ 4 files changed, 69 insertions(+), 1 deletion(-)
+ create mode 100644 src/main/java/com/ebcont/k8/triage/InvestigatorAgent.java
+ create mode 100644 src/main/java/com/ebcont/k8/triage/TriageRunner.java
+
+diff --git a/build.gradle b/build.gradle
+index e2acc36..1eee676 100644
+--- a/build.gradle
++++ b/build.gradle
+@@ -22,7 +22,7 @@ ext {
+ }
+ 
+ dependencies {
+-	implementation 'org.springframework.ai:spring-ai-starter-model-bedrock'
++	implementation 'org.springframework.ai:spring-ai-starter-model-bedrock-converse'
+ 	implementation 'org.springframework.boot:spring-boot-starter-jackson'
+ 	implementation 'io.fabric8:kubernetes-client:7.9.0'
+ 	testImplementation 'org.springframework.boot:spring-boot-starter-test'
+diff --git a/src/main/java/com/ebcont/k8/triage/InvestigatorAgent.java b/src/main/java/com/ebcont/k8/triage/InvestigatorAgent.java
+new file mode 100644
+index 0000000..8c72587
+--- /dev/null
++++ b/src/main/java/com/ebcont/k8/triage/InvestigatorAgent.java
+@@ -0,0 +1,28 @@
++package com.ebcont.k8.triage;
++
++import org.springframework.ai.chat.client.ChatClient;
++import org.springframework.stereotype.Component;
++
++import java.util.List;
++
++@Component
++public class InvestigatorAgent {
++
++    private final ChatClient chatClient;
++
++    public InvestigatorAgent(ChatClient.Builder builder, KubernetesDiagnosticTools diagnosticTools) {
++        // Spring AI runs the tool-call loop internally: each @Tool call is executed and fed back
++        // to the model until it returns a final answer.
++        this.chatClient = builder
++                .defaultSystem(KubernetesDiagnosticTools.INVESTIGATOR_PROMPT)
++                .defaultTools(diagnosticTools)
++                .build();
++    }
++
++    public String investigate(List<String> namespaces) {
++        return chatClient.prompt()
++                .user("Investigate the workloads in these Kubernetes namespaces: " + String.join(", ", namespaces))
++                .call()
++                .content();
++    }
++}
+diff --git a/src/main/java/com/ebcont/k8/triage/TriageRunner.java b/src/main/java/com/ebcont/k8/triage/TriageRunner.java
+new file mode 100644
+index 0000000..da80f20
+--- /dev/null
++++ b/src/main/java/com/ebcont/k8/triage/TriageRunner.java
+@@ -0,0 +1,31 @@
++package com.ebcont.k8.triage;
++
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++import org.springframework.beans.factory.annotation.Value;
++import org.springframework.boot.CommandLineRunner;
++import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
++import org.springframework.stereotype.Component;
++
++import java.util.List;
++
++@Component
++@ConditionalOnProperty(name = "triage.run", havingValue = "true")
++public class TriageRunner implements CommandLineRunner {
++
++    private static final Logger log = LoggerFactory.getLogger(TriageRunner.class);
++
++    private final InvestigatorAgent investigator;
++    private final List<String> namespaces;
++
++    public TriageRunner(InvestigatorAgent investigator, @Value("${triage.namespaces}") List<String> namespaces) {
++        this.investigator = investigator;
++        this.namespaces = namespaces;
++    }
++
++    @Override
++    public void run(String... args) {
++        log.info("Starting investigation of namespaces {}", namespaces);
++        log.info("Investigator: {}", investigator.investigate(namespaces));
++    }
++}
+diff --git a/src/main/resources/application.properties b/src/main/resources/application.properties
+index c5b2756..7714ab0 100644
+--- a/src/main/resources/application.properties
++++ b/src/main/resources/application.properties
+@@ -1,3 +1,12 @@
+ spring.application.name=k8.triage
+ k8s.context=kind-k8-triage-dev
+ k8s.log-tail-lines=200
++
++spring.ai.model.chat=bedrock-converse
++spring.ai.bedrock.aws.region=eu-west-1
++spring.ai.bedrock.converse.chat.options.model=openai.gpt-oss-120b-1:0
++spring.ai.bedrock.converse.chat.options.max-tokens=16000
++
++# Set to true (e.g. --triage.run=true) to run the investigator agent on startup
++triage.run=false
++triage.namespaces=default
+-- 
+2.53.0
+

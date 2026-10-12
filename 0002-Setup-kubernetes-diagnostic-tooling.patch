@@ -1,0 +1,484 @@
+From cbb4da61eb8649146d7ce3132ede9319263439e7 Mon Sep 17 00:00:00 2001
+From: Kevin Per <kevin.per@ebcont.com>
+Date: Mon, 12 Oct 2026 09:05:44 +0200
+Subject: [PATCH 2/7] Setup kubernetes diagnostic tooling
+
+---
+ build.gradle                                  |   2 +
+ gradlew                                       |   0
+ .../triage/Application.java:Zone.Identifier   | Bin 81 -> 0 bytes
+ .../ebcont/k8/triage/KubernetesConfig.java    |  19 +
+ .../k8/triage/KubernetesDiagnosticTools.java  | 397 ++++++++++++++++++
+ src/main/resources/application.properties     |   2 +
+ 6 files changed, 420 insertions(+)
+ mode change 100644 => 100755 gradlew
+ delete mode 100644 src/main/java/com/ebcont/k8/triage/Application.java:Zone.Identifier
+ create mode 100644 src/main/java/com/ebcont/k8/triage/KubernetesConfig.java
+ create mode 100644 src/main/java/com/ebcont/k8/triage/KubernetesDiagnosticTools.java
+
+diff --git a/build.gradle b/build.gradle
+index c3eb93b..e2acc36 100644
+--- a/build.gradle
++++ b/build.gradle
+@@ -23,6 +23,8 @@ ext {
+ 
+ dependencies {
+ 	implementation 'org.springframework.ai:spring-ai-starter-model-bedrock'
++	implementation 'org.springframework.boot:spring-boot-starter-jackson'
++	implementation 'io.fabric8:kubernetes-client:7.9.0'
+ 	testImplementation 'org.springframework.boot:spring-boot-starter-test'
+ 	testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+ }
+diff --git a/gradlew b/gradlew
+old mode 100644
+new mode 100755
+diff --git a/src/main/java/com/ebcont/k8/triage/Application.java:Zone.Identifier b/src/main/java/com/ebcont/k8/triage/Application.java:Zone.Identifier
+deleted file mode 100644
+index a92db72d0917c4888f16ff50cee035a73fccc2f6..0000000000000000000000000000000000000000
+GIT binary patch
+literal 0
+HcmV?d00001
+
+literal 81
+zcma!!%Fjy;DN4*MPD?F{<>dl#JyUFrdAWj8fg(kzMWIDGw$4^Dp~b01#WCKgWtn+;
+g0jWhXF8SqoIr)hx#WC3ydL>1fiRr0&Rhb100GjR`_y7O^
+
+diff --git a/src/main/java/com/ebcont/k8/triage/KubernetesConfig.java b/src/main/java/com/ebcont/k8/triage/KubernetesConfig.java
+new file mode 100644
+index 0000000..f1226ac
+--- /dev/null
++++ b/src/main/java/com/ebcont/k8/triage/KubernetesConfig.java
+@@ -0,0 +1,19 @@
++package com.ebcont.k8.triage;
++
++import io.fabric8.kubernetes.client.Config;
++import io.fabric8.kubernetes.client.KubernetesClient;
++import io.fabric8.kubernetes.client.KubernetesClientBuilder;
++import org.springframework.beans.factory.annotation.Value;
++import org.springframework.context.annotation.Bean;
++import org.springframework.context.annotation.Configuration;
++
++@Configuration
++public class KubernetesConfig {
++
++    @Bean(destroyMethod = "close")
++    public KubernetesClient kubernetesClient(@Value("${k8s.context}") String context) {
++        return new KubernetesClientBuilder()
++                .withConfig(Config.autoConfigure(context))
++                .build();
++    }
++}
+diff --git a/src/main/java/com/ebcont/k8/triage/KubernetesDiagnosticTools.java b/src/main/java/com/ebcont/k8/triage/KubernetesDiagnosticTools.java
+new file mode 100644
+index 0000000..098b286
+--- /dev/null
++++ b/src/main/java/com/ebcont/k8/triage/KubernetesDiagnosticTools.java
+@@ -0,0 +1,397 @@
++package com.ebcont.k8.triage;
++
++import io.fabric8.kubernetes.api.model.Container;
++import io.fabric8.kubernetes.api.model.ContainerState;
++import io.fabric8.kubernetes.api.model.ContainerStatus;
++import io.fabric8.kubernetes.api.model.EnvVar;
++import io.fabric8.kubernetes.api.model.Event;
++import io.fabric8.kubernetes.api.model.IntOrString;
++import io.fabric8.kubernetes.api.model.Pod;
++import io.fabric8.kubernetes.api.model.PodSpec;
++import io.fabric8.kubernetes.api.model.Quantity;
++import io.fabric8.kubernetes.api.model.apps.Deployment;
++import io.fabric8.kubernetes.api.model.apps.ReplicaSet;
++import io.fabric8.kubernetes.client.KubernetesClient;
++import io.fabric8.kubernetes.client.KubernetesClientException;
++import org.springframework.ai.tool.annotation.Tool;
++import org.springframework.ai.tool.annotation.ToolParam;
++import org.springframework.beans.factory.annotation.Value;
++import org.springframework.stereotype.Component;
++
++import java.util.Comparator;
++import java.util.List;
++import java.util.Map;
++import java.util.Objects;
++import java.util.function.Supplier;
++import java.util.stream.Collectors;
++
++@Component
++public class KubernetesDiagnosticTools {
++
++    public static String INVESTIGATOR_PROMPT = """
++            You are a Kubernetes SRE collecting evidence about a cluster. Use the tools
++            to find unhealthy pods and deployments. For every unhealthy workload, gather its pod details, logs
++            and events, its Kubernetes deployment and rollout history, and the matching GitHub repo's recent
++            deployments and commit diffs. Changes made outside GitHub (e.g. manual kubectl edits) are also
++            possible. Do not diagnose: a separate root cause agent will analyse everything you collect.
++            When you have gathered enough evidence, reply with one line saying you are done.
++            """;
++
++    public static String ROOT_CAUSE_PROMPT = """
++            You are a root cause analysis agent. You receive all evidence an investigator
++            collected from Kubernetes and GitHub. Using only that evidence, write a short report: for each
++            unhealthy workload, give the symptom, the root cause, the offending change (commit/author or
++            manual edit) with the evidence that proves it, and a concrete fix. Say so if the evidence is
++            insufficient.
++            """;
++
++    private static final String REVISION_ANNOTATION = "deployment.kubernetes.io/revision";
++    private static final String CHANGE_CAUSE_ANNOTATION = "kubernetes.io/change-cause";
++    private static final String LAST_APPLIED_ANNOTATION = "kubectl.kubernetes.io/last-applied-configuration";
++
++    private final KubernetesClient client;
++    private final int logTailLines;
++
++    public KubernetesDiagnosticTools(KubernetesClient client, @Value("${k8s.log-tail-lines:200}") int logTailLines) {
++        this.client = client;
++        this.logTailLines = logTailLines;
++    }
++
++    @Tool(description = "List pods in a namespace with ready containers, status, restarts and owner (like `kubectl get pods`).")
++    public String listPods(@ToolParam(description = "Namespace to list pods in") String namespace) {
++        return call(() -> {
++            List<Pod> pods = client.pods().inNamespace(namespace).list().getItems();
++            if (pods.isEmpty()) {
++                return "No pods found in namespace " + namespace + ".";
++            }
++            StringBuilder sb = new StringBuilder("NAME  READY  STATUS  RESTARTS  OWNER\n");
++            for (Pod pod : pods) {
++                List<ContainerStatus> statuses = pod.getStatus().getContainerStatuses() == null
++                        ? List.of() : pod.getStatus().getContainerStatuses();
++                long ready = statuses.stream().filter(s -> Boolean.TRUE.equals(s.getReady())).count();
++                int restarts = statuses.stream().mapToInt(s -> intOrZero(s.getRestartCount())).sum();
++                // Like kubectl, prefer a container's waiting/terminated reason (e.g. CrashLoopBackOff) over the pod phase.
++                String status = statuses.stream()
++                        .map(ContainerStatus::getState)
++                        .filter(Objects::nonNull)
++                        .map(s -> s.getWaiting() != null ? s.getWaiting().getReason()
++                                : s.getTerminated() != null ? s.getTerminated().getReason() : null)
++                        .filter(Objects::nonNull)
++                        .findFirst()
++                        .orElse(pod.getStatus().getPhase());
++                var owners = pod.getMetadata().getOwnerReferences();
++                String owner = owners == null || owners.isEmpty()
++                        ? "<none>" : owners.getFirst().getKind() + "/" + owners.getFirst().getName();
++                sb.append(pod.getMetadata().getName()).append("  ")
++                        .append(ready).append('/').append(pod.getSpec().getContainers().size()).append("  ")
++                        .append(status).append("  ")
++                        .append(restarts).append("  ")
++                        .append(owner).append('\n');
++            }
++            return sb.toString();
++        });
++    }
++
++    @Tool(description = "Fetch recent container logs for a pod (like `kubectl logs`).")
++    public String getPodLogs(@ToolParam(description = "Pod name") String id,
++                             @ToolParam(description = "Namespace of the pod") String namespace) {
++        return call(() -> {
++            Pod pod = client.pods().inNamespace(namespace).withName(id).get();
++            if (pod == null) {
++                return notFound("Pod", id, namespace);
++            }
++            StringBuilder sb = new StringBuilder();
++            for (Container container : pod.getSpec().getContainers()) {
++                String name = container.getName();
++                var resource = client.pods().inNamespace(namespace).withName(id).inContainer(name);
++                sb.append("=== Container ").append(name).append(" (last ").append(logTailLines).append(" lines) ===\n");
++                sb.append(orEmpty(resource.tailingLines(logTailLines).getLog())).append('\n');
++
++                ContainerStatus status = containerStatus(pod, name);
++                if (status != null && status.getRestartCount() != null && status.getRestartCount() > 0) {
++                    sb.append("=== Container ").append(name).append(" previous instance (restarts: ")
++                            .append(status.getRestartCount()).append(") ===\n");
++                    try {
++                        sb.append(orEmpty(resource.terminated().tailingLines(logTailLines).getLog())).append('\n');
++                    } catch (KubernetesClientException e) {
++                        sb.append("(previous logs unavailable: ").append(e.getMessage()).append(")\n");
++                    }
++                }
++            }
++            return sb.toString();
++        });
++    }
++
++    @Tool(description = "Describe a pod: image, resource limits, env var names, container state and last state (like `kubectl describe pod`).")
++    public String describePod(@ToolParam(description = "Pod name") String id,
++                              @ToolParam(description = "Namespace of the pod") String namespace) {
++        return call(() -> {
++            Pod pod = client.pods().inNamespace(namespace).withName(id).get();
++            if (pod == null) {
++                return notFound("Pod", id, namespace);
++            }
++            StringBuilder sb = new StringBuilder();
++            sb.append("Name:       ").append(pod.getMetadata().getName()).append('\n');
++            sb.append("Namespace:  ").append(pod.getMetadata().getNamespace()).append('\n');
++            sb.append("Node:       ").append(pod.getSpec().getNodeName()).append('\n');
++            sb.append("Created:    ").append(pod.getMetadata().getCreationTimestamp()).append('\n');
++            sb.append("Labels:     ").append(pod.getMetadata().getLabels()).append('\n');
++            sb.append("Status:     ").append(pod.getStatus().getPhase());
++            if (pod.getStatus().getReason() != null) {
++                sb.append(" (").append(pod.getStatus().getReason()).append(": ").append(pod.getStatus().getMessage()).append(')');
++            }
++            sb.append('\n');
++            if (pod.getMetadata().getOwnerReferences() != null) {
++                pod.getMetadata().getOwnerReferences().forEach(o ->
++                        sb.append("Controlled By: ").append(o.getKind()).append('/').append(o.getName()).append('\n'));
++            }
++
++            sb.append("Containers:\n");
++            for (Container container : pod.getSpec().getContainers()) {
++                appendContainer(sb, container, "  ");
++                ContainerStatus status = containerStatus(pod, container.getName());
++                if (status != null) {
++                    sb.append("    State:         ").append(formatState(status.getState())).append('\n');
++                    sb.append("    Last State:    ").append(formatState(status.getLastState())).append('\n');
++                    sb.append("    Ready:         ").append(status.getReady()).append('\n');
++                    sb.append("    Restart Count: ").append(status.getRestartCount()).append('\n');
++                }
++            }
++
++            sb.append("Conditions:\n");
++            if (pod.getStatus().getConditions() != null) {
++                pod.getStatus().getConditions().forEach(c -> sb.append("  ").append(c.getType()).append('=')
++                        .append(c.getStatus())
++                        .append(c.getReason() != null ? " (" + c.getReason() + ": " + c.getMessage() + ")" : "")
++                        .append('\n'));
++            }
++            return sb.toString();
++        });
++    }
++
++    @Tool(description = "Fetch Kubernetes events for a pod (like `kubectl get events --field-selector involvedObject.name=<pod>`).")
++    public String getPodEvents(@ToolParam(description = "Pod name") String id,
++                               @ToolParam(description = "Namespace of the pod") String namespace) {
++        return call(() -> {
++            List<Event> events = client.v1().events().inNamespace(namespace)
++                    .withField("involvedObject.name", id)
++                    .list().getItems();
++            if (events.isEmpty()) {
++                return "No events found for pod " + namespace + "/" + id
++                        + " (events expire after ~1h by default).";
++            }
++            return events.stream()
++                    .sorted(Comparator.comparing(KubernetesDiagnosticTools::eventTimestamp, Comparator.nullsFirst(Comparator.naturalOrder())))
++                    .map(e -> String.join("  ",
++                            String.valueOf(eventTimestamp(e)),
++                            String.valueOf(e.getType()),
++                            String.valueOf(e.getReason()),
++                            "x" + (e.getCount() != null ? e.getCount() : 1),
++                            String.valueOf(e.getMessage())))
++                    .collect(Collectors.joining("\n", "TIME  TYPE  REASON  COUNT  MESSAGE\n", "\n"));
++        });
++    }
++
++    @Tool(description = "List deployments in a namespace with ready replicas and current image (like `kubectl get deployments`).")
++    public String listDeployments(@ToolParam(description = "Namespace to list deployments in") String namespace) {
++        return call(() -> {
++            List<Deployment> deployments = client.apps().deployments().inNamespace(namespace).list().getItems();
++            if (deployments.isEmpty()) {
++                return "No deployments found in namespace " + namespace + ".";
++            }
++            StringBuilder sb = new StringBuilder("NAME  READY  UP-TO-DATE  AVAILABLE  IMAGES\n");
++            for (Deployment d : deployments) {
++                var status = d.getStatus();
++                sb.append(d.getMetadata().getName()).append("  ")
++                        .append(intOrZero(status.getReadyReplicas())).append('/').append(intOrZero(d.getSpec().getReplicas())).append("  ")
++                        .append(intOrZero(status.getUpdatedReplicas())).append("  ")
++                        .append(intOrZero(status.getAvailableReplicas())).append("  ")
++                        .append(images(d.getSpec().getTemplate().getSpec())).append('\n');
++            }
++            return sb.toString();
++        });
++    }
++
++    @Tool(description = "Describe a deployment: strategy, conditions and rollout history (like `kubectl describe deployment` plus `kubectl rollout history`).")
++    public String describeDeployment(@ToolParam(description = "Deployment name") String deployment,
++                                     @ToolParam(description = "Namespace of the deployment") String namespace) {
++        return call(() -> {
++            Deployment d = client.apps().deployments().inNamespace(namespace).withName(deployment).get();
++            if (d == null) {
++                return notFound("Deployment", deployment, namespace);
++            }
++            StringBuilder sb = new StringBuilder();
++            Map<String, String> annotations = orEmpty(d.getMetadata().getAnnotations());
++            sb.append("Name:       ").append(d.getMetadata().getName()).append('\n');
++            sb.append("Namespace:  ").append(d.getMetadata().getNamespace()).append('\n');
++            sb.append("Created:    ").append(d.getMetadata().getCreationTimestamp()).append('\n');
++            sb.append("Generation: ").append(d.getMetadata().getGeneration())
++                    .append(" (observed: ").append(d.getStatus().getObservedGeneration()).append(")\n");
++            sb.append("Revision:   ").append(annotations.get(REVISION_ANNOTATION)).append('\n');
++            sb.append("Managed by kubectl apply: ").append(annotations.containsKey(LAST_APPLIED_ANNOTATION)).append('\n');
++            sb.append("Selector:   ").append(d.getSpec().getSelector().getMatchLabels()).append('\n');
++            sb.append("Replicas:   ").append(intOrZero(d.getSpec().getReplicas())).append(" desired | ")
++                    .append(intOrZero(d.getStatus().getUpdatedReplicas())).append(" updated | ")
++                    .append(intOrZero(d.getStatus().getReadyReplicas())).append(" ready | ")
++                    .append(intOrZero(d.getStatus().getAvailableReplicas())).append(" available | ")
++                    .append(intOrZero(d.getStatus().getUnavailableReplicas())).append(" unavailable\n");
++
++            var strategy = d.getSpec().getStrategy();
++            sb.append("Strategy:   ").append(strategy.getType());
++            if (strategy.getRollingUpdate() != null) {
++                sb.append(" (maxSurge=").append(formatIntOrString(strategy.getRollingUpdate().getMaxSurge()))
++                        .append(", maxUnavailable=").append(formatIntOrString(strategy.getRollingUpdate().getMaxUnavailable()))
++                        .append(')');
++            }
++            sb.append('\n');
++
++            sb.append("Pod Template Containers:\n");
++            for (Container container : d.getSpec().getTemplate().getSpec().getContainers()) {
++                appendContainer(sb, container, "  ");
++            }
++
++            sb.append("Conditions:\n");
++            if (d.getStatus().getConditions() != null) {
++                d.getStatus().getConditions().forEach(c -> sb.append("  ").append(c.getType()).append('=')
++                        .append(c.getStatus()).append(" (").append(c.getReason()).append(": ").append(c.getMessage())
++                        .append(", last update ").append(c.getLastUpdateTime()).append(")\n"));
++            }
++
++            sb.append("Rollout History:\n");
++            String uid = d.getMetadata().getUid();
++            List<ReplicaSet> replicaSets = client.apps().replicaSets().inNamespace(namespace).list().getItems().stream()
++                    .filter(rs -> rs.getMetadata().getOwnerReferences() != null
++                            && rs.getMetadata().getOwnerReferences().stream().anyMatch(o -> uid.equals(o.getUid())))
++                    .sorted(Comparator.comparingLong(KubernetesDiagnosticTools::revision))
++                    .toList();
++            if (replicaSets.isEmpty()) {
++                sb.append("  (no ReplicaSets found)\n");
++            }
++            for (ReplicaSet rs : replicaSets) {
++                Map<String, String> rsAnnotations = orEmpty(rs.getMetadata().getAnnotations());
++                sb.append("  REVISION ").append(revision(rs))
++                        .append("  replicaset=").append(rs.getMetadata().getName())
++                        .append("  created=").append(rs.getMetadata().getCreationTimestamp())
++                        .append("  replicas=").append(intOrZero(rs.getStatus().getReadyReplicas())).append('/')
++                        .append(intOrZero(rs.getSpec().getReplicas()))
++                        .append("  images=").append(images(rs.getSpec().getTemplate().getSpec()))
++                        .append("  change-cause=").append(rsAnnotations.getOrDefault(CHANGE_CAUSE_ANNOTATION, "<none>"))
++                        .append('\n');
++            }
++            return sb.toString();
++        });
++    }
++
++    private String call(Supplier<String> action) {
++        try {
++            return action.get();
++        } catch (KubernetesClientException e) {
++            return "Error: Kubernetes API call failed (HTTP " + e.getCode() + "): " + e.getMessage();
++        } catch (RuntimeException e) {
++            return "Error: " + e.getMessage();
++        }
++    }
++
++    private static String notFound(String kind, String name, String namespace) {
++        return "Error: " + kind + " " + namespace + "/" + name + " not found.";
++    }
++
++    private static void appendContainer(StringBuilder sb, Container container, String indent) {
++        sb.append(indent).append(container.getName()).append(":\n");
++        sb.append(indent).append("  Image:         ").append(container.getImage()).append('\n');
++        if (container.getResources() != null) {
++            sb.append(indent).append("  Requests:      ").append(formatQuantities(container.getResources().getRequests())).append('\n');
++            sb.append(indent).append("  Limits:        ").append(formatQuantities(container.getResources().getLimits())).append('\n');
++        }
++        // Names only: values may contain secrets.
++        List<String> envNames = container.getEnv() == null ? List.of()
++                : container.getEnv().stream().map(EnvVar::getName).toList();
++        sb.append(indent).append("  Env (names):   ").append(envNames).append('\n');
++        if (container.getEnvFrom() != null && !container.getEnvFrom().isEmpty()) {
++            List<String> sources = container.getEnvFrom().stream()
++                    .map(s -> s.getConfigMapRef() != null ? "configmap/" + s.getConfigMapRef().getName()
++                            : s.getSecretRef() != null ? "secret/" + s.getSecretRef().getName() : "unknown")
++                    .toList();
++            sb.append(indent).append("  Env From:      ").append(sources).append('\n');
++        }
++    }
++
++    private static ContainerStatus containerStatus(Pod pod, String containerName) {
++        if (pod.getStatus() == null || pod.getStatus().getContainerStatuses() == null) {
++            return null;
++        }
++        return pod.getStatus().getContainerStatuses().stream()
++                .filter(s -> containerName.equals(s.getName()))
++                .findFirst()
++                .orElse(null);
++    }
++
++    private static String formatState(ContainerState state) {
++        if (state == null) {
++            return "<none>";
++        }
++        if (state.getRunning() != null) {
++            return "Running (started " + state.getRunning().getStartedAt() + ")";
++        }
++        if (state.getWaiting() != null) {
++            return "Waiting (reason=" + state.getWaiting().getReason() + ", message=" + state.getWaiting().getMessage() + ")";
++        }
++        if (state.getTerminated() != null) {
++            var t = state.getTerminated();
++            return "Terminated (reason=" + t.getReason() + ", exitCode=" + t.getExitCode()
++                    + ", message=" + t.getMessage() + ", started=" + t.getStartedAt() + ", finished=" + t.getFinishedAt() + ")";
++        }
++        return "<none>";
++    }
++
++    private static String formatQuantities(Map<String, Quantity> quantities) {
++        if (quantities == null || quantities.isEmpty()) {
++            return "<none>";
++        }
++        return quantities.entrySet().stream()
++                .map(e -> e.getKey() + "=" + e.getValue().getAmount() + orEmpty(e.getValue().getFormat()))
++                .collect(Collectors.joining(", "));
++    }
++
++    private static String formatIntOrString(IntOrString value) {
++        if (value == null) {
++            return "<none>";
++        }
++        return value.getStrVal() != null ? value.getStrVal() : String.valueOf(value.getIntVal());
++    }
++
++    private static String images(PodSpec spec) {
++        return spec.getContainers().stream().map(Container::getImage).collect(Collectors.joining(","));
++    }
++
++    private static String eventTimestamp(Event e) {
++        if (e.getLastTimestamp() != null) {
++            return e.getLastTimestamp();
++        }
++        if (e.getEventTime() != null && e.getEventTime().getTime() != null) {
++            return e.getEventTime().getTime();
++        }
++        return e.getMetadata().getCreationTimestamp();
++    }
++
++    private static long revision(ReplicaSet rs) {
++        String revision = orEmpty(rs.getMetadata().getAnnotations()).get(REVISION_ANNOTATION);
++        try {
++            return revision == null ? 0 : Long.parseLong(revision);
++        } catch (NumberFormatException e) {
++            return 0;
++        }
++    }
++
++    private static int intOrZero(Integer value) {
++        return value == null ? 0 : value;
++    }
++
++    private static String orEmpty(String value) {
++        return Objects.requireNonNullElse(value, "");
++    }
++
++    private static Map<String, String> orEmpty(Map<String, String> map) {
++        return map == null ? Map.of() : map;
++    }
++}
+diff --git a/src/main/resources/application.properties b/src/main/resources/application.properties
+index ceb9965..c5b2756 100644
+--- a/src/main/resources/application.properties
++++ b/src/main/resources/application.properties
+@@ -1 +1,3 @@
+ spring.application.name=k8.triage
++k8s.context=kind-k8-triage-dev
++k8s.log-tail-lines=200
+-- 
+2.53.0
+

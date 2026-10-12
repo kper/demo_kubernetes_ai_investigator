@@ -1,0 +1,669 @@
+From 85817a3603fd0934fddbbc89b0e5dcbcd19e2927 Mon Sep 17 00:00:00 2001
+From: Kevin Per <kevin.per@ebcont.com>
+Date: Mon, 12 Oct 2026 10:35:23 +0200
+Subject: [PATCH 7/7] Created workflow with Camunda
+
+---
+ build.gradle                                  |   1 +
+ scripts/camunda-down.sh                       |   8 +
+ scripts/camunda-up.sh                         |  41 ++++
+ .../ebcont/k8/triage/RollbackProposal.java    |  20 ++
+ .../com/ebcont/k8/triage/RollbackTools.java   |  81 ++++++++
+ .../com/ebcont/k8/triage/TriageRunner.java    |  79 ++++---
+ .../com/ebcont/k8/triage/TriageWorkers.java   |  86 ++++++++
+ src/main/resources/application.properties     |   6 +
+ src/main/resources/bpmn/approve-rollback.form |  31 +++
+ src/main/resources/bpmn/k8-triage.bpmn        | 194 ++++++++++++++++++
+ 10 files changed, 513 insertions(+), 34 deletions(-)
+ create mode 100755 scripts/camunda-down.sh
+ create mode 100755 scripts/camunda-up.sh
+ create mode 100644 src/main/java/com/ebcont/k8/triage/RollbackProposal.java
+ create mode 100644 src/main/java/com/ebcont/k8/triage/RollbackTools.java
+ create mode 100644 src/main/java/com/ebcont/k8/triage/TriageWorkers.java
+ create mode 100644 src/main/resources/bpmn/approve-rollback.form
+ create mode 100644 src/main/resources/bpmn/k8-triage.bpmn
+
+diff --git a/build.gradle b/build.gradle
+index 33305a6..9e7a655 100644
+--- a/build.gradle
++++ b/build.gradle
+@@ -26,6 +26,7 @@ dependencies {
+ 	implementation 'org.springframework.boot:spring-boot-starter-jackson'
+ 	implementation 'io.fabric8:kubernetes-client:7.9.0'
+ 	runtimeOnly 'software.amazon.awssdk:signin:2.51.2'
++	implementation 'io.camunda:camunda-spring-boot-4-starter:8.9.21'
+ 	testImplementation 'org.springframework.boot:spring-boot-starter-test'
+ 	testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+ }
+diff --git a/scripts/camunda-down.sh b/scripts/camunda-down.sh
+new file mode 100755
+index 0000000..b7ac946
+--- /dev/null
++++ b/scripts/camunda-down.sh
+@@ -0,0 +1,8 @@
++#!/bin/sh
++# Stop and remove the Camunda container started by scripts/camunda-up.sh.
++#
++#   scripts/camunda-down.sh
++set -eu
++
++docker rm -f camunda-dev
++echo "Removed Camunda"
+diff --git a/scripts/camunda-up.sh b/scripts/camunda-up.sh
+new file mode 100755
+index 0000000..e5e3695
+--- /dev/null
++++ b/scripts/camunda-up.sh
+@@ -0,0 +1,41 @@
++#!/bin/sh
++# Start a local Camunda 8 (Zeebe, Operate, Tasklist) in one Docker container, with in-memory H2 storage.
++# Replaces the container if it already exists. Remove it with scripts/camunda-down.sh.
++#
++#   scripts/camunda-up.sh
++#
++# Then: Tasklist http://localhost:8080/tasklist and Operate http://localhost:8080/operate (login demo/demo).
++# Everything is lost when the container stops.
++set -eu
++
++CONTAINER=camunda-dev
++
++command -v docker >/dev/null || { echo "error: docker is not installed" >&2; exit 1; }
++
++docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
++docker run -d --name "$CONTAINER" -p 8080:8080 -p 26500:26500 -p 9600:9600 \
++  -e CAMUNDA_DATA_SECONDARYSTORAGE_TYPE=rdbms \
++  -e CAMUNDA_DATA_SECONDARYSTORAGE_RDBMS_URL='jdbc:h2:mem:camunda;DB_CLOSE_DELAY=-1;MODE=PostgreSQL' \
++  -e CAMUNDA_DATA_SECONDARYSTORAGE_RDBMS_USERNAME=sa \
++  -e CAMUNDA_DATA_SECONDARYSTORAGE_RDBMS_PASSWORD= \
++  -e CAMUNDA_SECURITY_AUTHENTICATION_UNPROTECTEDAPI=true \
++  -e CAMUNDA_SECURITY_AUTHORIZATIONS_ENABLED=false \
++  -e CAMUNDA_SECURITY_INITIALIZATION_USERS_0_USERNAME=demo \
++  -e CAMUNDA_SECURITY_INITIALIZATION_USERS_0_PASSWORD=demo \
++  -e CAMUNDA_SECURITY_INITIALIZATION_USERS_0_NAME=Demo \
++  -e CAMUNDA_SECURITY_INITIALIZATION_USERS_0_EMAIL=demo@example.com \
++  -e CAMUNDA_SECURITY_INITIALIZATION_DEFAULTROLES_ADMIN_USERS_0=demo \
++  camunda/camunda:8.9.21
++
++echo "==> Waiting for Camunda (about a minute)"
++deadline=$(($(date +%s) + 180))
++until curl -fs http://localhost:9600/actuator/health/status >/dev/null 2>&1 \
++    && curl -fs http://localhost:8080/v2/topology >/dev/null 2>&1; do
++  if [ "$(date +%s)" -gt "$deadline" ]; then
++    echo "error: Camunda did not become healthy" >&2
++    docker logs --tail 50 "$CONTAINER" >&2
++    exit 1
++  fi
++  sleep 3
++done
++echo "Ready. Tasklist http://localhost:8080/tasklist, Operate http://localhost:8080/operate (demo/demo)"
+diff --git a/src/main/java/com/ebcont/k8/triage/RollbackProposal.java b/src/main/java/com/ebcont/k8/triage/RollbackProposal.java
+new file mode 100644
+index 0000000..b9682e1
+--- /dev/null
++++ b/src/main/java/com/ebcont/k8/triage/RollbackProposal.java
+@@ -0,0 +1,20 @@
++package com.ebcont.k8.triage;
++
++/**
++ * A rollback the root cause agent proposed, as process variable {@code rollback} of one "Approve rollback" user task.
++ * {@code key} is "namespace/deployment".
++ */
++public record RollbackProposal(String key, String namespace, String deployment, int toRevision, String command,
++                               String reason, String symptom, String rootCause) {
++
++    /** The proposal for a finding with a recommended rollback, or null. */
++    static RollbackProposal of(RootCauseReport.Finding finding) {
++        String command = RootCauseReport.rollbackCommand(finding);
++        if (command == null) {
++            return null;
++        }
++        return new RollbackProposal(finding.namespace() + "/" + finding.deployment(), finding.namespace(),
++                finding.deployment(), finding.rollback().toRevision(), command, finding.rollback().reason(),
++                finding.symptom(), finding.rootCause());
++    }
++}
+diff --git a/src/main/java/com/ebcont/k8/triage/RollbackTools.java b/src/main/java/com/ebcont/k8/triage/RollbackTools.java
+new file mode 100644
+index 0000000..fdb8620
+--- /dev/null
++++ b/src/main/java/com/ebcont/k8/triage/RollbackTools.java
+@@ -0,0 +1,81 @@
++package com.ebcont.k8.triage;
++
++import io.fabric8.kubernetes.api.model.PodTemplateSpec;
++import io.fabric8.kubernetes.api.model.PodTemplateSpecBuilder;
++import io.fabric8.kubernetes.api.model.apps.Deployment;
++import io.fabric8.kubernetes.api.model.apps.DeploymentBuilder;
++import io.fabric8.kubernetes.api.model.apps.ReplicaSet;
++import io.fabric8.kubernetes.client.KubernetesClient;
++import io.fabric8.kubernetes.client.KubernetesClientException;
++import org.springframework.ai.tool.annotation.Tool;
++import org.springframework.ai.tool.annotation.ToolParam;
++import org.springframework.stereotype.Component;
++
++import java.util.HashMap;
++import java.util.Map;
++import java.util.Optional;
++
++@Component
++public class RollbackTools {
++
++    private static final String REVISION_ANNOTATION = "deployment.kubernetes.io/revision";
++    private static final String CHANGE_CAUSE_ANNOTATION = "kubernetes.io/change-cause";
++    private static final String POD_TEMPLATE_HASH_LABEL = "pod-template-hash";
++
++    private final KubernetesClient client;
++
++    public RollbackTools(KubernetesClient client) {
++        this.client = client;
++    }
++
++    @Tool(description = "Roll back a deployment to a revision from its rollout history (like `kubectl rollout undo --to-revision`).")
++    public String rollbackDeployment(@ToolParam(description = "Deployment name") String deployment,
++                                     @ToolParam(description = "Namespace of the deployment") String namespace,
++                                     @ToolParam(description = "Revision from the rollout history to roll back to") int toRevision) {
++        try {
++            Deployment current = client.apps().deployments().inNamespace(namespace).withName(deployment).get();
++            if (current == null) {
++                return "Error: Deployment " + namespace + "/" + deployment + " not found.";
++            }
++            Optional<ReplicaSet> target = replicaSet(current, toRevision);
++            if (target.isEmpty()) {
++                return "Error: revision " + toRevision + " of deployment " + namespace + "/" + deployment
++                        + " not found in its rollout history.";
++            }
++
++            // Like kubectl rollout undo: restore the revision's pod template, without the label the controller adds.
++            PodTemplateSpec template = new PodTemplateSpecBuilder(target.get().getSpec().getTemplate()).build();
++            Map<String, String> labels = new HashMap<>(template.getMetadata().getLabels());
++            labels.remove(POD_TEMPLATE_HASH_LABEL);
++            template.getMetadata().setLabels(labels);
++
++            client.apps().deployments().inNamespace(namespace).withName(deployment).edit(d -> new DeploymentBuilder(d)
++                    .editMetadata()
++                        .addToAnnotations(CHANGE_CAUSE_ANNOTATION, "triage: rollback to revision " + toRevision + " (approved)")
++                    .endMetadata()
++                    .editSpec()
++                        .withTemplate(template)
++                    .endSpec()
++                    .build());
++            return "Rolled back deployment " + namespace + "/" + deployment + " to revision " + toRevision + ".";
++        } catch (KubernetesClientException e) {
++            return "Error: Kubernetes API call failed (HTTP " + e.getCode() + "): " + e.getMessage();
++        } catch (RuntimeException e) {
++            return "Error: " + e.getMessage();
++        }
++    }
++
++    private Optional<ReplicaSet> replicaSet(Deployment deployment, int revision) {
++        String uid = deployment.getMetadata().getUid();
++        return client.apps().replicaSets().inNamespace(deployment.getMetadata().getNamespace()).list().getItems().stream()
++                .filter(rs -> rs.getMetadata().getOwnerReferences() != null
++                        && rs.getMetadata().getOwnerReferences().stream().anyMatch(o -> uid.equals(o.getUid())))
++                .filter(rs -> String.valueOf(revision).equals(annotation(rs, REVISION_ANNOTATION)))
++                .findFirst();
++    }
++
++    private static String annotation(ReplicaSet rs, String name) {
++        Map<String, String> annotations = rs.getMetadata().getAnnotations();
++        return annotations == null ? null : annotations.get(name);
++    }
++}
+diff --git a/src/main/java/com/ebcont/k8/triage/TriageRunner.java b/src/main/java/com/ebcont/k8/triage/TriageRunner.java
+index df998d6..4117d42 100644
+--- a/src/main/java/com/ebcont/k8/triage/TriageRunner.java
++++ b/src/main/java/com/ebcont/k8/triage/TriageRunner.java
+@@ -1,5 +1,8 @@
+ package com.ebcont.k8.triage;
+ 
++import io.camunda.client.CamundaClient;
++import io.camunda.client.api.command.ProblemException;
++import io.camunda.client.api.search.enums.ProcessInstanceState;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ import org.springframework.beans.factory.annotation.Value;
+@@ -7,56 +10,64 @@ import org.springframework.boot.CommandLineRunner;
+ import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+ import org.springframework.stereotype.Component;
+ 
++import java.time.Duration;
++import java.time.Instant;
+ import java.util.List;
++import java.util.Map;
+ 
++/**
++ * Deploys and starts the k8-triage process (src/main/resources/bpmn/k8-triage.bpmn), then keeps running as its job
++ * worker until the process instance ends. Rollbacks are approved or rejected as user tasks in Camunda Tasklist.
++ */
+ @Component
+ @ConditionalOnProperty(name = "triage.run", havingValue = "true")
+ public class TriageRunner implements CommandLineRunner {
+ 
+     private static final Logger log = LoggerFactory.getLogger(TriageRunner.class);
++    private static final String PROCESS_ID = "k8-triage";
++    /** How long a new process instance may be missing from the search storage before that counts as an error. */
++    private static final Duration EXPORT_GRACE = Duration.ofMinutes(2);
+ 
+-    private final InvestigatorAgent investigator;
+-    private final RootCauseAgent rootCause;
+-    private final KubernetesDiagnosticTools diagnosticTools;
++    private final CamundaClient client;
+     private final List<String> namespaces;
+ 
+-    public TriageRunner(InvestigatorAgent investigator, RootCauseAgent rootCause,
+-                        KubernetesDiagnosticTools diagnosticTools,
+-                        @Value("${triage.namespaces}") List<String> namespaces) {
+-        this.investigator = investigator;
+-        this.rootCause = rootCause;
+-        this.diagnosticTools = diagnosticTools;
++    public TriageRunner(CamundaClient client, @Value("${triage.namespaces}") List<String> namespaces) {
++        this.client = client;
+         this.namespaces = namespaces;
+     }
+ 
+     @Override
+-    public void run(String... args) {
+-        log.info("Starting investigation of namespaces {}", namespaces);
+-        diagnosticTools.clearEvidence();
+-        String investigation = investigator.investigate(namespaces);
+-        log.info("Investigator: {}", investigation);
+-
+-        List<String> evidence = diagnosticTools.evidence();
+-        log.info("Running root cause analysis on {} tool results", evidence.size());
+-        RootCauseReport report = rootCause.analyse(evidence, investigation);
+-        for (RootCauseReport.Finding finding : report.findings()) {
+-            log.info("""
+-                            {}/{}
+-                              Symptom:    {}
+-                              Root cause: {}
+-                              Change:     {}
+-                              Evidence:   {}
+-                              Fix:        {}
+-                              Rollback:   {}""",
+-                    finding.namespace(), finding.deployment(), finding.symptom(), finding.rootCause(),
+-                    finding.offendingChange(), finding.evidence(), finding.fix(), formatRollback(finding));
++    public void run(String... args) throws InterruptedException {
++        client.newDeployResourceCommand()
++                .addResourceFromClasspath("bpmn/k8-triage.bpmn")
++                .addResourceFromClasspath("bpmn/approve-rollback.form")
++                .send().join();
++
++        long processInstanceKey = client.newCreateInstanceCommand()
++                .bpmnProcessId(PROCESS_ID)
++                .latestVersion()
++                .variables(Map.of("namespaces", namespaces))
++                .send().join()
++                .getProcessInstanceKey();
++        log.info("Started triage of namespaces {}: http://localhost:8080/operate/processes/{}", namespaces, processInstanceKey);
++
++        Instant started = Instant.now();
++        ProcessInstanceState state;
++        while ((state = state(processInstanceKey, started)) == ProcessInstanceState.ACTIVE) {
++            Thread.sleep(5000);
+         }
++        log.info("Triage process instance {} ended: {}", processInstanceKey, state);
+     }
+ 
+-    private static String formatRollback(RootCauseReport.Finding finding) {
+-        String command = RootCauseReport.rollbackCommand(finding);
+-        String reason = finding.rollback() == null ? "" : " (" + finding.rollback().reason() + ")";
+-        // Only proposed: nothing is rolled back automatically.
+-        return (command != null ? "proposed: " + command : "not recommended") + reason;
++    private ProcessInstanceState state(long processInstanceKey, Instant started) {
++        try {
++            return client.newProcessInstanceGetRequest(processInstanceKey).send().join().getState();
++        } catch (ProblemException e) {
++            // Right after the start, the instance may not be exported to the search storage yet.
++            if (e.code() == 404 && Instant.now().isBefore(started.plus(EXPORT_GRACE))) {
++                return ProcessInstanceState.ACTIVE;
++            }
++            throw e;
++        }
+     }
+ }
+diff --git a/src/main/java/com/ebcont/k8/triage/TriageWorkers.java b/src/main/java/com/ebcont/k8/triage/TriageWorkers.java
+new file mode 100644
+index 0000000..c3af13f
+--- /dev/null
++++ b/src/main/java/com/ebcont/k8/triage/TriageWorkers.java
+@@ -0,0 +1,86 @@
++package com.ebcont.k8.triage;
++
++import io.camunda.client.annotation.JobWorker;
++import io.camunda.client.annotation.Variable;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
++import org.springframework.stereotype.Component;
++
++import java.util.List;
++import java.util.Map;
++import java.util.Objects;
++
++/** Job workers for the service tasks of the k8-triage process (src/main/resources/bpmn/k8-triage.bpmn). */
++@Component
++@ConditionalOnProperty(name = "triage.run", havingValue = "true")
++public class TriageWorkers {
++
++    private static final Logger log = LoggerFactory.getLogger(TriageWorkers.class);
++    private static final long LLM_TIMEOUT_MS = 10 * 60 * 1000;
++
++    private final InvestigatorAgent investigator;
++    private final RootCauseAgent rootCause;
++    private final KubernetesDiagnosticTools diagnosticTools;
++    private final RollbackTools rollbackTools;
++
++    public TriageWorkers(InvestigatorAgent investigator, RootCauseAgent rootCause,
++                         KubernetesDiagnosticTools diagnosticTools, RollbackTools rollbackTools) {
++        this.investigator = investigator;
++        this.rootCause = rootCause;
++        this.diagnosticTools = diagnosticTools;
++        this.rollbackTools = rollbackTools;
++    }
++
++    @JobWorker(type = "investigate", timeout = LLM_TIMEOUT_MS, fetchVariables = "namespaces")
++    public Map<String, Object> investigate(@Variable("namespaces") List<String> namespaces) {
++        log.info("Starting investigation of namespaces {}", namespaces);
++        diagnosticTools.clearEvidence();
++        String answer = investigator.investigate(namespaces);
++        log.info("Investigator: {}", answer);
++        return Map.of("investigationEvidence", diagnosticTools.evidence(), "investigationAnswer", answer);
++    }
++
++    @JobWorker(type = "analyse-root-cause", timeout = LLM_TIMEOUT_MS,
++            fetchVariables = {"investigationEvidence", "investigationAnswer"})
++    public Map<String, Object> analyse(@Variable("investigationEvidence") List<String> evidence,
++                                       @Variable("investigationAnswer") String answer) {
++        log.info("Running root cause analysis on {} tool results", evidence.size());
++        RootCauseReport report = rootCause.analyse(evidence, answer);
++        report.findings().forEach(TriageWorkers::logFinding);
++        List<RollbackProposal> rollbacks = report.findings().stream()
++                .map(RollbackProposal::of)
++                .filter(Objects::nonNull)
++                .toList();
++        log.info("{} rollback(s) waiting for approval in Tasklist: http://localhost:8080/tasklist", rollbacks.size());
++        return Map.of("report", report, "rollbacks", rollbacks);
++    }
++
++    @JobWorker(type = "rollback-deployment", fetchVariables = {"rollback", "comment"})
++    public Map<String, Object> rollback(@Variable("rollback") RollbackProposal rollback, @Variable("comment") String comment) {
++        log.info("Rollback of {} approved{}", rollback.key(), comment == null || comment.isBlank() ? "" : ": " + comment);
++        String result = rollbackTools.rollbackDeployment(rollback.deployment(), rollback.namespace(), rollback.toRevision());
++        if (result.startsWith("Error:")) {
++            // Fails the job; with retries=1 this becomes an incident in Operate.
++            throw new IllegalStateException(result);
++        }
++        log.info(result);
++        return Map.of("rollbackResult", result);
++    }
++
++    private static void logFinding(RootCauseReport.Finding finding) {
++        String command = RootCauseReport.rollbackCommand(finding);
++        String reason = finding.rollback() == null ? "" : " (" + finding.rollback().reason() + ")";
++        log.info("""
++                        {}/{}
++                          Symptom:    {}
++                          Root cause: {}
++                          Change:     {}
++                          Evidence:   {}
++                          Fix:        {}
++                          Rollback:   {}""",
++                finding.namespace(), finding.deployment(), finding.symptom(), finding.rootCause(),
++                finding.offendingChange(), finding.evidence(), finding.fix(),
++                (command != null ? "proposed: " + command : "not recommended") + reason);
++    }
++}
+diff --git a/src/main/resources/application.properties b/src/main/resources/application.properties
+index 7714ab0..85c6328 100644
+--- a/src/main/resources/application.properties
++++ b/src/main/resources/application.properties
+@@ -10,3 +10,9 @@ spring.ai.bedrock.converse.chat.options.max-tokens=16000
+ # Set to true (e.g. --triage.run=true) to run the investigator agent on startup
+ triage.run=false
+ triage.namespaces=default
++
++# Camunda 8 from scripts/camunda-up.sh; the client (and its job workers) only runs with --triage.run=true
++camunda.client.enabled=${triage.run:false}
++camunda.client.mode=self-managed
++camunda.client.grpc-address=http://localhost:26500
++camunda.client.rest-address=http://localhost:8080
+diff --git a/src/main/resources/bpmn/approve-rollback.form b/src/main/resources/bpmn/approve-rollback.form
+new file mode 100644
+index 0000000..248f7cc
+--- /dev/null
++++ b/src/main/resources/bpmn/approve-rollback.form
+@@ -0,0 +1,31 @@
++{
++  "id": "approve-rollback",
++  "type": "default",
++  "executionPlatform": "Camunda Cloud",
++  "executionPlatformVersion": "8.9.0",
++  "schemaVersion": 18,
++  "components": [
++    {
++      "id": "Text_Proposal",
++      "type": "text",
++      "text": "# Roll back {{rollback.key}}?\n\n**Symptom:** {{rollback.symptom}}\n\n**Root cause:** {{rollback.rootCause}}\n\n**Proposed:** `{{rollback.command}}`\n\n**Why:** {{rollback.reason}}"
++    },
++    {
++      "id": "Radio_Decision",
++      "type": "radio",
++      "key": "decision",
++      "label": "Decision",
++      "validate": { "required": true },
++      "values": [
++        { "label": "Approve the rollback", "value": "approve" },
++        { "label": "Reject", "value": "reject" }
++      ]
++    },
++    {
++      "id": "Textarea_Comment",
++      "type": "textarea",
++      "key": "comment",
++      "label": "Comment"
++    }
++  ]
++}
+diff --git a/src/main/resources/bpmn/k8-triage.bpmn b/src/main/resources/bpmn/k8-triage.bpmn
+new file mode 100644
+index 0000000..fe28f43
+--- /dev/null
++++ b/src/main/resources/bpmn/k8-triage.bpmn
+@@ -0,0 +1,194 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
++                  xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI"
++                  xmlns:dc="http://www.omg.org/spec/DD/20100524/DC"
++                  xmlns:di="http://www.omg.org/spec/DD/20100524/DI"
++                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0"
++                  xmlns:modeler="http://camunda.org/schema/modeler/1.0"
++                  id="Definitions_k8_triage"
++                  targetNamespace="http://bpmn.io/schema/bpmn"
++                  exporter="Camunda Modeler"
++                  exporterVersion="5.0.0"
++                  modeler:executionPlatform="Camunda Cloud"
++                  modeler:executionPlatformVersion="8.9.0">
++  <bpmn:process id="k8-triage" name="Kubernetes triage" isExecutable="true">
++    <bpmn:startEvent id="StartEvent_Requested" name="Triage requested">
++      <bpmn:outgoing>Flow_ToInvestigate</bpmn:outgoing>
++    </bpmn:startEvent>
++    <bpmn:serviceTask id="Task_Investigate" name="Investigate cluster">
++      <bpmn:extensionElements>
++        <zeebe:taskDefinition type="investigate" retries="2" />
++      </bpmn:extensionElements>
++      <bpmn:incoming>Flow_ToInvestigate</bpmn:incoming>
++      <bpmn:outgoing>Flow_ToAnalyse</bpmn:outgoing>
++    </bpmn:serviceTask>
++    <bpmn:serviceTask id="Task_Analyse" name="Analyse root cause">
++      <bpmn:extensionElements>
++        <zeebe:taskDefinition type="analyse-root-cause" retries="2" />
++      </bpmn:extensionElements>
++      <bpmn:incoming>Flow_ToAnalyse</bpmn:incoming>
++      <bpmn:outgoing>Flow_ToGateway</bpmn:outgoing>
++    </bpmn:serviceTask>
++    <bpmn:exclusiveGateway id="Gateway_HasRollbacks" name="Rollbacks proposed?" default="Flow_NoRollbacks">
++      <bpmn:incoming>Flow_ToGateway</bpmn:incoming>
++      <bpmn:outgoing>Flow_HasRollbacks</bpmn:outgoing>
++      <bpmn:outgoing>Flow_NoRollbacks</bpmn:outgoing>
++    </bpmn:exclusiveGateway>
++    <bpmn:subProcess id="SubProcess_Rollback" name="Decide on rollback">
++      <bpmn:extensionElements>
++        <!-- Local per proposal, so parallel approvals don't overwrite each other's form values. -->
++        <zeebe:ioMapping>
++          <zeebe:input source="=null" target="decision" />
++          <zeebe:input source="=null" target="comment" />
++          <zeebe:input source="=null" target="rollbackResult" />
++        </zeebe:ioMapping>
++      </bpmn:extensionElements>
++      <bpmn:incoming>Flow_HasRollbacks</bpmn:incoming>
++      <bpmn:outgoing>Flow_ToDone</bpmn:outgoing>
++      <bpmn:multiInstanceLoopCharacteristics>
++        <bpmn:extensionElements>
++          <zeebe:loopCharacteristics inputCollection="=rollbacks" inputElement="rollback" />
++        </bpmn:extensionElements>
++      </bpmn:multiInstanceLoopCharacteristics>
++      <bpmn:startEvent id="StartEvent_Proposal" name="Rollback proposed">
++        <bpmn:outgoing>Flow_ToApprove</bpmn:outgoing>
++      </bpmn:startEvent>
++      <bpmn:userTask id="Task_Approve" name="Approve rollback">
++        <bpmn:extensionElements>
++          <zeebe:userTask />
++          <zeebe:formDefinition formId="approve-rollback" />
++        </bpmn:extensionElements>
++        <bpmn:incoming>Flow_ToApprove</bpmn:incoming>
++        <bpmn:outgoing>Flow_ToApproved</bpmn:outgoing>
++      </bpmn:userTask>
++      <bpmn:exclusiveGateway id="Gateway_Approved" name="Approved?" default="Flow_Rejected">
++        <bpmn:incoming>Flow_ToApproved</bpmn:incoming>
++        <bpmn:outgoing>Flow_Approved</bpmn:outgoing>
++        <bpmn:outgoing>Flow_Rejected</bpmn:outgoing>
++      </bpmn:exclusiveGateway>
++      <bpmn:serviceTask id="Task_Rollback" name="Roll back deployment">
++        <bpmn:extensionElements>
++          <!-- No retries: a failed rollback becomes an incident in Operate. -->
++          <zeebe:taskDefinition type="rollback-deployment" retries="1" />
++        </bpmn:extensionElements>
++        <bpmn:incoming>Flow_Approved</bpmn:incoming>
++        <bpmn:outgoing>Flow_ToRolledBack</bpmn:outgoing>
++      </bpmn:serviceTask>
++      <bpmn:endEvent id="EndEvent_RolledBack" name="Rolled back">
++        <bpmn:incoming>Flow_ToRolledBack</bpmn:incoming>
++      </bpmn:endEvent>
++      <bpmn:endEvent id="EndEvent_Rejected" name="Rejected">
++        <bpmn:incoming>Flow_Rejected</bpmn:incoming>
++      </bpmn:endEvent>
++      <bpmn:sequenceFlow id="Flow_ToApprove" sourceRef="StartEvent_Proposal" targetRef="Task_Approve" />
++      <bpmn:sequenceFlow id="Flow_ToApproved" sourceRef="Task_Approve" targetRef="Gateway_Approved" />
++      <bpmn:sequenceFlow id="Flow_Approved" name="yes" sourceRef="Gateway_Approved" targetRef="Task_Rollback">
++        <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">=decision = "approve"</bpmn:conditionExpression>
++      </bpmn:sequenceFlow>
++      <bpmn:sequenceFlow id="Flow_Rejected" name="no" sourceRef="Gateway_Approved" targetRef="EndEvent_Rejected" />
++      <bpmn:sequenceFlow id="Flow_ToRolledBack" sourceRef="Task_Rollback" targetRef="EndEvent_RolledBack" />
++    </bpmn:subProcess>
++    <bpmn:endEvent id="EndEvent_Done" name="Triage finished">
++      <bpmn:incoming>Flow_ToDone</bpmn:incoming>
++    </bpmn:endEvent>
++    <bpmn:endEvent id="EndEvent_NoRollbacks" name="Nothing to roll back">
++      <bpmn:incoming>Flow_NoRollbacks</bpmn:incoming>
++    </bpmn:endEvent>
++    <bpmn:sequenceFlow id="Flow_ToInvestigate" sourceRef="StartEvent_Requested" targetRef="Task_Investigate" />
++    <bpmn:sequenceFlow id="Flow_ToAnalyse" sourceRef="Task_Investigate" targetRef="Task_Analyse" />
++    <bpmn:sequenceFlow id="Flow_ToGateway" sourceRef="Task_Analyse" targetRef="Gateway_HasRollbacks" />
++    <bpmn:sequenceFlow id="Flow_HasRollbacks" name="yes" sourceRef="Gateway_HasRollbacks" targetRef="SubProcess_Rollback">
++      <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">=count(rollbacks) &gt; 0</bpmn:conditionExpression>
++    </bpmn:sequenceFlow>
++    <bpmn:sequenceFlow id="Flow_NoRollbacks" name="no" sourceRef="Gateway_HasRollbacks" targetRef="EndEvent_NoRollbacks" />
++    <bpmn:sequenceFlow id="Flow_ToDone" sourceRef="SubProcess_Rollback" targetRef="EndEvent_Done" />
++  </bpmn:process>
++  <bpmndi:BPMNDiagram id="BPMNDiagram_k8_triage">
++    <bpmndi:BPMNPlane id="BPMNPlane_k8_triage" bpmnElement="k8-triage">
++      <bpmndi:BPMNShape id="Shape_StartEvent_Requested" bpmnElement="StartEvent_Requested">
++        <dc:Bounds x="152" y="202" width="36" height="36" />
++      </bpmndi:BPMNShape>
++      <bpmndi:BPMNShape id="Shape_Task_Investigate" bpmnElement="Task_Investigate">
++        <dc:Bounds x="240" y="180" width="100" height="80" />
++      </bpmndi:BPMNShape>
++      <bpmndi:BPMNShape id="Shape_Task_Analyse" bpmnElement="Task_Analyse">
++        <dc:Bounds x="390" y="180" width="100" height="80" />
++      </bpmndi:BPMNShape>
++      <bpmndi:BPMNShape id="Shape_Gateway_HasRollbacks" bpmnElement="Gateway_HasRollbacks" isMarkerVisible="true">
++        <dc:Bounds x="545" y="195" width="50" height="50" />
++      </bpmndi:BPMNShape>
++      <bpmndi:BPMNShape id="Shape_SubProcess_Rollback" bpmnElement="SubProcess_Rollback" isExpanded="true">
++        <dc:Bounds x="650" y="100" width="620" height="250" />
++      </bpmndi:BPMNShape>
++      <bpmndi:BPMNShape id="Shape_StartEvent_Proposal" bpmnElement="StartEvent_Proposal">
++        <dc:Bounds x="690" y="182" width="36" height="36" />
++      </bpmndi:BPMNShape>
++      <bpmndi:BPMNShape id="Shape_Task_Approve" bpmnElement="Task_Approve">
++        <dc:Bounds x="780" y="160" width="100" height="80" />
++      </bpmndi:BPMNShape>
++      <bpmndi:BPMNShape id="Shape_Gateway_Approved" bpmnElement="Gateway_Approved" isMarkerVisible="true">
++        <dc:Bounds x="935" y="175" width="50" height="50" />
++      </bpmndi:BPMNShape>
++      <bpmndi:BPMNShape id="Shape_Task_Rollback" bpmnElement="Task_Rollback">
++        <dc:Bounds x="1040" y="160" width="100" height="80" />
++      </bpmndi:BPMNShape>
++      <bpmndi:BPMNShape id="Shape_EndEvent_RolledBack" bpmnElement="EndEvent_RolledBack">
++        <dc:Bounds x="1192" y="182" width="36" height="36" />
++      </bpmndi:BPMNShape>
++      <bpmndi:BPMNShape id="Shape_EndEvent_Rejected" bpmnElement="EndEvent_Rejected">
++        <dc:Bounds x="1072" y="272" width="36" height="36" />
++      </bpmndi:BPMNShape>
++      <bpmndi:BPMNShape id="Shape_EndEvent_Done" bpmnElement="EndEvent_Done">
++        <dc:Bounds x="1332" y="207" width="36" height="36" />
++      </bpmndi:BPMNShape>
++      <bpmndi:BPMNShape id="Shape_EndEvent_NoRollbacks" bpmnElement="EndEvent_NoRollbacks">
++        <dc:Bounds x="552" y="402" width="36" height="36" />
++      </bpmndi:BPMNShape>
++      <bpmndi:BPMNEdge id="Edge_Flow_ToInvestigate" bpmnElement="Flow_ToInvestigate">
++        <di:waypoint x="188" y="220" />
++        <di:waypoint x="240" y="220" />
++      </bpmndi:BPMNEdge>
++      <bpmndi:BPMNEdge id="Edge_Flow_ToAnalyse" bpmnElement="Flow_ToAnalyse">
++        <di:waypoint x="340" y="220" />
++        <di:waypoint x="390" y="220" />
++      </bpmndi:BPMNEdge>
++      <bpmndi:BPMNEdge id="Edge_Flow_ToGateway" bpmnElement="Flow_ToGateway">
++        <di:waypoint x="490" y="220" />
++        <di:waypoint x="545" y="220" />
++      </bpmndi:BPMNEdge>
++      <bpmndi:BPMNEdge id="Edge_Flow_HasRollbacks" bpmnElement="Flow_HasRollbacks">
++        <di:waypoint x="595" y="220" />
++        <di:waypoint x="650" y="220" />
++      </bpmndi:BPMNEdge>
++      <bpmndi:BPMNEdge id="Edge_Flow_NoRollbacks" bpmnElement="Flow_NoRollbacks">
++        <di:waypoint x="570" y="245" />
++        <di:waypoint x="570" y="402" />
++      </bpmndi:BPMNEdge>
++      <bpmndi:BPMNEdge id="Edge_Flow_ToApprove" bpmnElement="Flow_ToApprove">
++        <di:waypoint x="726" y="200" />
++        <di:waypoint x="780" y="200" />
++      </bpmndi:BPMNEdge>
++      <bpmndi:BPMNEdge id="Edge_Flow_ToApproved" bpmnElement="Flow_ToApproved">
++        <di:waypoint x="880" y="200" />
++        <di:waypoint x="935" y="200" />
++      </bpmndi:BPMNEdge>
++      <bpmndi:BPMNEdge id="Edge_Flow_Approved" bpmnElement="Flow_Approved">
++        <di:waypoint x="985" y="200" />
++        <di:waypoint x="1040" y="200" />
++      </bpmndi:BPMNEdge>
++      <bpmndi:BPMNEdge id="Edge_Flow_Rejected" bpmnElement="Flow_Rejected">
++        <di:waypoint x="960" y="225" />
++        <di:waypoint x="960" y="290" />
++        <di:waypoint x="1072" y="290" />
++      </bpmndi:BPMNEdge>
++      <bpmndi:BPMNEdge id="Edge_Flow_ToRolledBack" bpmnElement="Flow_ToRolledBack">
++        <di:waypoint x="1140" y="200" />
++        <di:waypoint x="1192" y="200" />
++      </bpmndi:BPMNEdge>
++      <bpmndi:BPMNEdge id="Edge_Flow_ToDone" bpmnElement="Flow_ToDone">
++        <di:waypoint x="1270" y="225" />
++        <di:waypoint x="1332" y="225" />
++      </bpmndi:BPMNEdge>
++    </bpmndi:BPMNPlane>
++  </bpmndi:BPMNDiagram>
++</bpmn:definitions>
+-- 
+2.53.0
+
