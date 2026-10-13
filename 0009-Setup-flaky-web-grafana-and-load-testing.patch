@@ -1,0 +1,1050 @@
+From 9dc04855a296649957f7491fe83aef36250bb338 Mon Sep 17 00:00:00 2001
+From: Kevin Per <kevin.per@ebcont.com>
+Date: Tue, 13 Oct 2026 09:16:31 +0200
+Subject: [PATCH 09/10] Setup flaky-web, grafana and load-testing
+
+---
+ k8s/grafana/alloy.yaml                 |  39 +++
+ k8s/grafana/charts.txt                 |   6 +
+ k8s/grafana/grafana-mcp.yaml           |  10 +
+ k8s/grafana/kube-prometheus-stack.yaml |  34 ++
+ k8s/grafana/loki.yaml                  |  23 ++
+ scripts/flaky-web-up.sh                |  61 ++++
+ scripts/flaky-web/dashboard.json       | 434 +++++++++++++++++++++++++
+ scripts/flaky-web/k8s.yaml             |  40 +++
+ scripts/flaky-web/kustomization.yaml   |  13 +
+ scripts/flaky-web/monitoring.yaml      |  14 +
+ scripts/grafana-down.sh                |  23 ++
+ scripts/grafana-up.sh                  |  77 +++++
+ scripts/load-test.sh                   | 109 +++++++
+ scripts/load-test/Dockerfile           |   8 +
+ scripts/load-test/job.yaml             |  28 ++
+ 15 files changed, 919 insertions(+)
+ create mode 100644 k8s/grafana/alloy.yaml
+ create mode 100644 k8s/grafana/charts.txt
+ create mode 100644 k8s/grafana/grafana-mcp.yaml
+ create mode 100644 k8s/grafana/kube-prometheus-stack.yaml
+ create mode 100644 k8s/grafana/loki.yaml
+ create mode 100755 scripts/flaky-web-up.sh
+ create mode 100644 scripts/flaky-web/dashboard.json
+ create mode 100644 scripts/flaky-web/k8s.yaml
+ create mode 100644 scripts/flaky-web/kustomization.yaml
+ create mode 100644 scripts/flaky-web/monitoring.yaml
+ create mode 100755 scripts/grafana-down.sh
+ create mode 100755 scripts/grafana-up.sh
+ create mode 100755 scripts/load-test.sh
+ create mode 100644 scripts/load-test/Dockerfile
+ create mode 100644 scripts/load-test/job.yaml
+
+diff --git a/k8s/grafana/alloy.yaml b/k8s/grafana/alloy.yaml
+new file mode 100644
+index 0000000..7ae4672
+--- /dev/null
++++ b/k8s/grafana/alloy.yaml
+@@ -0,0 +1,39 @@
++# Alloy tails every pod's logs through the Kubernetes API (no host mounts) and ships them to Loki.
++controller: {type: deployment, replicas: 1}
++alloy:
++  configMap:
++    content: |
++      discovery.kubernetes "pods" {
++        role = "pod"
++      }
++
++      discovery.relabel "pods" {
++        targets = discovery.kubernetes.pods.targets
++        rule {
++          source_labels = ["__meta_kubernetes_namespace"]
++          target_label  = "namespace"
++        }
++        rule {
++          source_labels = ["__meta_kubernetes_pod_name"]
++          target_label  = "pod"
++        }
++        rule {
++          source_labels = ["__meta_kubernetes_pod_container_name"]
++          target_label  = "container"
++        }
++        rule {
++          source_labels = ["__meta_kubernetes_pod_label_app"]
++          target_label  = "app"
++        }
++      }
++
++      loki.source.kubernetes "pods" {
++        targets    = discovery.relabel.pods.output
++        forward_to = [loki.write.default.receiver]
++      }
++
++      loki.write "default" {
++        endpoint {
++          url = "http://loki:3100/loki/api/v1/push"
++        }
++      }
+diff --git a/k8s/grafana/charts.txt b/k8s/grafana/charts.txt
+new file mode 100644
+index 0000000..8b3057b
+--- /dev/null
++++ b/k8s/grafana/charts.txt
+@@ -0,0 +1,6 @@
++# Helm releases of the Grafana stack: <release/chart name> <chart repo> <chart version>.
++# Each release's values are in <release>.yaml next to this file. Read by scripts/grafana-up.sh and scripts/grafana-down.sh.
++kube-prometheus-stack https://prometheus-community.github.io/helm-charts 92.2.0
++loki                  https://grafana-community.github.io/helm-charts    18.15.1
++alloy                 https://grafana.github.io/helm-charts              1.13.1
++grafana-mcp           https://grafana-community.github.io/helm-charts    0.27.1
+diff --git a/k8s/grafana/grafana-mcp.yaml b/k8s/grafana/grafana-mcp.yaml
+new file mode 100644
+index 0000000..3e6556a
+--- /dev/null
++++ b/k8s/grafana/grafana-mcp.yaml
+@@ -0,0 +1,10 @@
++# mcp-grafana, read-only, over streamable HTTP on :8000/mcp. Reached through `kubectl port-forward`,
++# so the Host header is 127.0.0.1:<random port>: Host validation is off. No anonymous usage stats.
++grafana:
++  url: http://grafana:80
++env:
++  GRAFANA_USERNAME: admin
++  GRAFANA_PASSWORD: admin
++disableWrite: true
++command: [/app/mcp-grafana]
++extraArgs: [--transport=streamable-http, --address=0.0.0.0:8000, --allowed-hosts=*, --usage-stats=disabled]
+diff --git a/k8s/grafana/kube-prometheus-stack.yaml b/k8s/grafana/kube-prometheus-stack.yaml
+new file mode 100644
+index 0000000..87881e4
+--- /dev/null
++++ b/k8s/grafana/kube-prometheus-stack.yaml
+@@ -0,0 +1,34 @@
++# Prometheus (+ kube-state-metrics for pod restarts, OOM kills, image pull errors) and Grafana, sized for kind.
++# Components kind doesn't expose or the triage doesn't need are off.
++alertmanager: {enabled: false}
++nodeExporter: {enabled: false}
++kubeEtcd: {enabled: false}
++kubeScheduler: {enabled: false}
++kubeControllerManager: {enabled: false}
++kubeProxy: {enabled: false}
++defaultRules: {create: false}
++# The admission webhooks only validate PrometheusRules etc.; their pre-install hook jobs hang under Helm 4
++# (it waits for the deletion of a hook ServiceAccount that doesn't exist).
++prometheusOperator:
++  admissionWebhooks: {enabled: false}
++  tls: {enabled: false}  # its certificate came from those hook jobs
++
++prometheus:
++  prometheusSpec:
++    scrapeInterval: 15s
++    retention: 1d
++
++grafana:
++  fullnameOverride: grafana
++  adminUser: admin
++  adminPassword: admin
++  defaultDashboardsTimezone: utc
++  sidecar:
++    datasources:
++      uid: prometheus  # stable UIDs, so MCP queries can name the datasource
++  additionalDataSources:
++    - name: Loki
++      uid: loki
++      type: loki
++      access: proxy
++      url: http://loki:3100
+diff --git a/k8s/grafana/loki.yaml b/k8s/grafana/loki.yaml
+new file mode 100644
+index 0000000..ce0eef5
+--- /dev/null
++++ b/k8s/grafana/loki.yaml
+@@ -0,0 +1,23 @@
++# Loki as a single binary on the local filesystem.
++deploymentMode: Monolithic
++loki:
++  auth_enabled: false
++  commonConfig: {replication_factor: 1}
++  storage: {type: filesystem}
++  schemaConfig:
++    configs:
++      - from: "2024-04-01"
++        store: tsdb
++        object_store: filesystem
++        schema: v13
++        index: {prefix: loki_index_, period: 24h}
++singleBinary: {replicas: 1}
++# the chart also defaults the simple-scalable targets to replicas > 0; monolithic needs them off
++read: {replicas: 0}
++write: {replicas: 0}
++backend: {replicas: 0}
++gateway: {enabled: false}
++chunksCache: {enabled: false}
++resultsCache: {enabled: false}
++lokiCanary: {enabled: false}
++test: {enabled: false}
+diff --git a/scripts/flaky-web-up.sh b/scripts/flaky-web-up.sh
+new file mode 100755
+index 0000000..5888bcb
+--- /dev/null
++++ b/scripts/flaky-web-up.sh
+@@ -0,0 +1,61 @@
++#!/bin/sh
++# Deploy flaky-web (random timeouts, Prometheus metrics) into the kind cluster from scripts/cluster-up.sh, from the
++# local Docker image flaky-web:dev, which must be built first:
++#
++#   docker build -t flaky-web:dev ../flaky-web
++#
++# When the Grafana stack from scripts/grafana-up.sh is up, also deploys its ServiceMonitor and Grafana dashboard
++# (Dashboards -> flaky-web); otherwise just the app. Rerun after rebuilding the image or installing the Grafana stack.
++#
++#   scripts/flaky-web-up.sh
++#   KIND_DEV_CLUSTER_NAME=my-cluster KIND_DEV_KUBECONFIG=/tmp/my.kubeconfig scripts/flaky-web-up.sh
++#
++# Then:
++#   kubectl --kubeconfig .cache/kind-dev.kubeconfig port-forward svc/flaky-web 8080
++set -eu
++set -x
++cd "$(dirname "$0")/.."
++
++CLUSTER=${KIND_DEV_CLUSTER_NAME:-k8-triage-dev}
++export KUBECONFIG=${KIND_DEV_KUBECONFIG:-$PWD/.cache/kind-dev.kubeconfig}
++IMAGE=flaky-web:dev
++
++for tool in docker kind kubectl; do
++  command -v "$tool" >/dev/null || { echo "error: $tool is not installed" >&2; exit 1; }
++done
++if ! kubectl cluster-info >/dev/null 2>&1; then
++  echo "error: no cluster at $KUBECONFIG; run scripts/cluster-up.sh first" >&2
++  exit 1
++fi
++if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
++  echo "error: no Docker image $IMAGE; build it first: docker build -t $IMAGE ../flaky-web" >&2
++  exit 1
++fi
++
++# Not `kind load docker-image`: with Docker's containerd image store it can fail on layers of other platforms
++# (see scripts/grafana-up.sh). The Deployment never pulls (imagePullPolicy: Never), so the image must be on the node.
++echo "==> Loading $IMAGE into kind"
++platform=$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$IMAGE")
++for node in $(kind get nodes --name "$CLUSTER"); do
++  docker save --platform "$platform" "$IMAGE" \
++    | docker exec -i "$node" ctr --namespace=k8s.io images import --digests --snapshotter=overlayfs - >/dev/null
++done
++
++existed=$(kubectl get deployment flaky-web -o name --ignore-not-found)
++if kubectl -n monitoring get deployment grafana >/dev/null 2>&1; then
++  echo "==> Deploying flaky-web with its ServiceMonitor and Grafana dashboard"
++  kubectl apply -k scripts/flaky-web
++else
++  echo "==> Deploying flaky-web (no Grafana stack: skipping its ServiceMonitor and dashboard)"
++  kubectl apply -f scripts/flaky-web/k8s.yaml
++fi
++# Same image tag, so a rebuilt image only reaches an existing Deployment through a restart.
++if [ -n "$existed" ]; then
++  kubectl rollout restart deployment/flaky-web
++fi
++kubectl rollout status deployment/flaky-web --timeout=120s
++
++kubectl get deployment,pods -l app=flaky-web
++echo
++echo "Ready. Kubeconfig: $KUBECONFIG"
++echo "  kubectl --kubeconfig $KUBECONFIG port-forward svc/flaky-web 8080   # http://localhost:8080"
+diff --git a/scripts/flaky-web/dashboard.json b/scripts/flaky-web/dashboard.json
+new file mode 100644
+index 0000000..787093e
+--- /dev/null
++++ b/scripts/flaky-web/dashboard.json
+@@ -0,0 +1,434 @@
++{
++  "uid": "flaky-web",
++  "title": "flaky-web",
++  "tags": [
++    "flaky-web"
++  ],
++  "timezone": "utc",
++  "schemaVersion": 41,
++  "refresh": "10s",
++  "time": {
++    "from": "now-30m",
++    "to": "now"
++  },
++  "panels": [
++    {
++      "id": 1,
++      "type": "stat",
++      "title": "Requests / s",
++      "datasource": {
++        "type": "prometheus",
++        "uid": "prometheus"
++      },
++      "gridPos": {
++        "x": 0,
++        "y": 0,
++        "w": 6,
++        "h": 4
++      },
++      "fieldConfig": {
++        "defaults": {
++          "unit": "reqps",
++          "decimals": 1,
++          "thresholds": {
++            "mode": "absolute",
++            "steps": [
++              {
++                "color": "green",
++                "value": null
++              }
++            ]
++          }
++        }
++      },
++      "options": {
++        "colorMode": "background",
++        "reduceOptions": {
++          "calcs": [
++            "lastNotNull"
++          ]
++        }
++      },
++      "targets": [
++        {
++          "refId": "A",
++          "datasource": {
++            "type": "prometheus",
++            "uid": "prometheus"
++          },
++          "expr": "sum(rate(http_requests_total{job=\"flaky-web\", path=\"/\"}[1m]))"
++        }
++      ]
++    },
++    {
++      "id": 2,
++      "type": "stat",
++      "title": "Timed out (504) ratio",
++      "datasource": {
++        "type": "prometheus",
++        "uid": "prometheus"
++      },
++      "gridPos": {
++        "x": 6,
++        "y": 0,
++        "w": 6,
++        "h": 4
++      },
++      "fieldConfig": {
++        "defaults": {
++          "unit": "percentunit",
++          "decimals": 1,
++          "thresholds": {
++            "mode": "absolute",
++            "steps": [
++              {
++                "color": "green",
++                "value": null
++              },
++              {
++                "color": "orange",
++                "value": 0.05
++              },
++              {
++                "color": "red",
++                "value": 0.15
++              }
++            ]
++          }
++        }
++      },
++      "options": {
++        "colorMode": "background",
++        "reduceOptions": {
++          "calcs": [
++            "lastNotNull"
++          ]
++        }
++      },
++      "targets": [
++        {
++          "refId": "A",
++          "datasource": {
++            "type": "prometheus",
++            "uid": "prometheus"
++          },
++          "expr": "sum(rate(http_requests_total{job=\"flaky-web\", path=\"/\", status=\"504\"}[5m])) / sum(rate(http_requests_total{job=\"flaky-web\", path=\"/\"}[5m]))"
++        }
++      ]
++    },
++    {
++      "id": 3,
++      "type": "stat",
++      "title": "p99 latency",
++      "datasource": {
++        "type": "prometheus",
++        "uid": "prometheus"
++      },
++      "gridPos": {
++        "x": 12,
++        "y": 0,
++        "w": 6,
++        "h": 4
++      },
++      "fieldConfig": {
++        "defaults": {
++          "unit": "s",
++          "decimals": 1,
++          "thresholds": {
++            "mode": "absolute",
++            "steps": [
++              {
++                "color": "green",
++                "value": null
++              },
++              {
++                "color": "orange",
++                "value": 1
++              },
++              {
++                "color": "red",
++                "value": 10
++              }
++            ]
++          }
++        }
++      },
++      "options": {
++        "colorMode": "background",
++        "reduceOptions": {
++          "calcs": [
++            "lastNotNull"
++          ]
++        }
++      },
++      "targets": [
++        {
++          "refId": "A",
++          "datasource": {
++            "type": "prometheus",
++            "uid": "prometheus"
++          },
++          "expr": "histogram_quantile(0.99, sum by (le) (rate(http_request_duration_seconds_bucket{job=\"flaky-web\", path=\"/\"}[5m])))"
++        }
++      ]
++    },
++    {
++      "id": 4,
++      "type": "stat",
++      "title": "In flight",
++      "datasource": {
++        "type": "prometheus",
++        "uid": "prometheus"
++      },
++      "gridPos": {
++        "x": 18,
++        "y": 0,
++        "w": 6,
++        "h": 4
++      },
++      "fieldConfig": {
++        "defaults": {
++          "unit": "short",
++          "decimals": 1,
++          "thresholds": {
++            "mode": "absolute",
++            "steps": [
++              {
++                "color": "green",
++                "value": null
++              },
++              {
++                "color": "orange",
++                "value": 5
++              },
++              {
++                "color": "red",
++                "value": 20
++              }
++            ]
++          }
++        }
++      },
++      "options": {
++        "colorMode": "background",
++        "reduceOptions": {
++          "calcs": [
++            "lastNotNull"
++          ]
++        }
++      },
++      "targets": [
++        {
++          "refId": "A",
++          "datasource": {
++            "type": "prometheus",
++            "uid": "prometheus"
++          },
++          "expr": "sum(http_requests_in_flight{job=\"flaky-web\", path=\"/\"})"
++        }
++      ]
++    },
++    {
++      "id": 5,
++      "type": "timeseries",
++      "title": "Requests by status",
++      "datasource": {
++        "type": "prometheus",
++        "uid": "prometheus"
++      },
++      "gridPos": {
++        "x": 0,
++        "y": 4,
++        "w": 12,
++        "h": 9
++      },
++      "fieldConfig": {
++        "defaults": {
++          "unit": "reqps"
++        },
++        "overrides": [
++          {
++            "matcher": {
++              "id": "byName",
++              "options": "504"
++            },
++            "properties": [
++              {
++                "id": "color",
++                "value": {
++                  "mode": "fixed",
++                  "fixedColor": "red"
++                }
++              }
++            ]
++          },
++          {
++            "matcher": {
++              "id": "byName",
++              "options": "200"
++            },
++            "properties": [
++              {
++                "id": "color",
++                "value": {
++                  "mode": "fixed",
++                  "fixedColor": "green"
++                }
++              }
++            ]
++          }
++        ]
++      },
++      "options": {
++        "legend": {
++          "displayMode": "list",
++          "placement": "bottom"
++        },
++        "tooltip": {
++          "mode": "multi"
++        }
++      },
++      "targets": [
++        {
++          "refId": "A",
++          "datasource": {
++            "type": "prometheus",
++            "uid": "prometheus"
++          },
++          "expr": "sum by (status) (rate(http_requests_total{job=\"flaky-web\", path=\"/\"}[1m]))",
++          "legendFormat": "{{status}}"
++        }
++      ]
++    },
++    {
++      "id": 6,
++      "type": "timeseries",
++      "title": "Latency percentiles",
++      "datasource": {
++        "type": "prometheus",
++        "uid": "prometheus"
++      },
++      "gridPos": {
++        "x": 12,
++        "y": 4,
++        "w": 12,
++        "h": 9
++      },
++      "fieldConfig": {
++        "defaults": {
++          "unit": "s"
++        },
++        "overrides": []
++      },
++      "options": {
++        "legend": {
++          "displayMode": "list",
++          "placement": "bottom"
++        },
++        "tooltip": {
++          "mode": "multi"
++        }
++      },
++      "targets": [
++        {
++          "refId": "A",
++          "datasource": {
++            "type": "prometheus",
++            "uid": "prometheus"
++          },
++          "expr": "histogram_quantile(0.5, sum by (le) (rate(http_request_duration_seconds_bucket{job=\"flaky-web\", path=\"/\"}[1m])))",
++          "legendFormat": "p50"
++        },
++        {
++          "refId": "B",
++          "datasource": {
++            "type": "prometheus",
++            "uid": "prometheus"
++          },
++          "expr": "histogram_quantile(0.9, sum by (le) (rate(http_request_duration_seconds_bucket{job=\"flaky-web\", path=\"/\"}[1m])))",
++          "legendFormat": "p90"
++        },
++        {
++          "refId": "C",
++          "datasource": {
++            "type": "prometheus",
++            "uid": "prometheus"
++          },
++          "expr": "histogram_quantile(0.99, sum by (le) (rate(http_request_duration_seconds_bucket{job=\"flaky-web\", path=\"/\"}[1m])))",
++          "legendFormat": "p99"
++        }
++      ]
++    },
++    {
++      "id": 7,
++      "type": "timeseries",
++      "title": "Requests in flight",
++      "datasource": {
++        "type": "prometheus",
++        "uid": "prometheus"
++      },
++      "gridPos": {
++        "x": 0,
++        "y": 13,
++        "w": 12,
++        "h": 8
++      },
++      "fieldConfig": {
++        "defaults": {
++          "unit": "short"
++        },
++        "overrides": []
++      },
++      "options": {
++        "legend": {
++          "displayMode": "list",
++          "placement": "bottom"
++        },
++        "tooltip": {
++          "mode": "multi"
++        }
++      },
++      "targets": [
++        {
++          "refId": "A",
++          "datasource": {
++            "type": "prometheus",
++            "uid": "prometheus"
++          },
++          "expr": "sum(http_requests_in_flight{job=\"flaky-web\", path=\"/\"})",
++          "legendFormat": "in flight"
++        }
++      ]
++    },
++    {
++      "id": 8,
++      "type": "logs",
++      "title": "Timed-out requests (Loki)",
++      "datasource": {
++        "type": "loki",
++        "uid": "loki"
++      },
++      "gridPos": {
++        "x": 12,
++        "y": 13,
++        "w": 12,
++        "h": 8
++      },
++      "options": {
++        "showTime": true,
++        "sortOrder": "Descending",
++        "wrapLogMessage": true
++      },
++      "targets": [
++        {
++          "refId": "A",
++          "datasource": {
++            "type": "loki",
++            "uid": "loki"
++          },
++          "expr": "{app=\"flaky-web\"} |= \"504\""
++        }
++      ]
++    }
++  ]
++}
+diff --git a/scripts/flaky-web/k8s.yaml b/scripts/flaky-web/k8s.yaml
+new file mode 100644
+index 0000000..2f60997
+--- /dev/null
++++ b/scripts/flaky-web/k8s.yaml
+@@ -0,0 +1,40 @@
++# flaky-web in the default namespace. The image is built locally and loaded into kind: scripts/flaky-web-up.sh.
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: flaky-web
++  namespace: default
++  labels: {app: flaky-web}
++spec:
++  replicas: 1
++  selector: {matchLabels: {app: flaky-web}}
++  template:
++    metadata: {labels: {app: flaky-web}}
++    spec:
++      containers:
++        - name: flaky-web
++          image: flaky-web
++          imagePullPolicy: Never  # loaded into kind, not in a registry
++          env:
++            - {name: TIMEOUT_RATE, value: "0.2"}
++            - {name: TIMEOUT_SECONDS, value: "30"}
++          ports:
++            - {name: http, containerPort: 8080}
++          readinessProbe:
++            httpGet: {path: /healthz, port: http}
++          livenessProbe:
++            httpGet: {path: /healthz, port: http}
++          resources:
++            requests: {cpu: 10m, memory: 16Mi}
++            limits: {memory: 64Mi}
++---
++apiVersion: v1
++kind: Service
++metadata:
++  name: flaky-web
++  namespace: default
++  labels: {app: flaky-web}
++spec:
++  selector: {app: flaky-web}
++  ports:
++    - {name: http, port: 8080, targetPort: http}
+diff --git a/scripts/flaky-web/kustomization.yaml b/scripts/flaky-web/kustomization.yaml
+new file mode 100644
+index 0000000..f67b461
+--- /dev/null
++++ b/scripts/flaky-web/kustomization.yaml
+@@ -0,0 +1,13 @@
++# flaky-web plus its ServiceMonitor and Grafana dashboard, once the Grafana stack is up: kubectl apply -k scripts/flaky-web
++# The dashboard ConfigMap carries the label Grafana's sidecar watches (any namespace), so it shows up in Grafana
++# under Dashboards -> flaky-web without importing anything. Edit it in Grafana, export the JSON into dashboard.json.
++resources:
++  - k8s.yaml
++  - monitoring.yaml
++configMapGenerator:
++  - name: flaky-web-dashboard
++    namespace: default
++    files: [dashboard.json]
++    options:
++      disableNameSuffixHash: true
++      labels: {grafana_dashboard: "1"}
+diff --git a/scripts/flaky-web/monitoring.yaml b/scripts/flaky-web/monitoring.yaml
+new file mode 100644
+index 0000000..6dac82d
+--- /dev/null
++++ b/scripts/flaky-web/monitoring.yaml
+@@ -0,0 +1,14 @@
++# Lets the kube-prometheus-stack Prometheus (scripts/grafana-up.sh) scrape flaky-web. Needs that stack's CRDs, so it
++# is applied only together with the dashboard (kustomization.yaml).
++apiVersion: monitoring.coreos.com/v1
++kind: ServiceMonitor
++metadata:
++  name: flaky-web
++  namespace: default
++  labels:
++    app: flaky-web
++    release: kube-prometheus-stack  # the Prometheus only selects ServiceMonitors with this label
++spec:
++  selector: {matchLabels: {app: flaky-web}}
++  endpoints:
++    - {port: http, path: /metrics, interval: 15s}
+diff --git a/scripts/grafana-down.sh b/scripts/grafana-down.sh
+new file mode 100755
+index 0000000..be7bc04
+--- /dev/null
++++ b/scripts/grafana-down.sh
+@@ -0,0 +1,23 @@
++#!/bin/sh
++# Uninstall the Grafana stack installed by scripts/grafana-up.sh and delete its namespace. The cluster keeps running.
++#
++#   scripts/grafana-down.sh
++#   KIND_DEV_KUBECONFIG=/tmp/my.kubeconfig scripts/grafana-down.sh
++set -eu
++set -x
++cd "$(dirname "$0")/.."
++
++export KUBECONFIG=${KIND_DEV_KUBECONFIG:-$PWD/.cache/kind-dev.kubeconfig}
++NAMESPACE=monitoring
++
++while read -r release repo version; do
++  case $release in ""|\#*) continue ;; esac
++  # No --wait: under Helm 4 it hung on kube-prometheus-stack after everything was deleted. Deleting the namespace
++  # below blocks until all of its resources are gone instead.
++  helm uninstall "$release" --namespace "$NAMESPACE" --ignore-not-found
++done < k8s/grafana/charts.txt
++kubectl delete namespace "$NAMESPACE" --ignore-not-found --timeout=5m
++# Created by the Prometheus operator, not Helm, so the uninstall leaves it behind.
++kubectl -n kube-system delete service kube-prometheus-stack-kubelet --ignore-not-found
++# kube-prometheus-stack leaves its CRDs (Prometheus, ServiceMonitor, ...) installed; they are harmless and reused.
++echo "Deleted the Grafana stack (namespace $NAMESPACE)"
+diff --git a/scripts/grafana-up.sh b/scripts/grafana-up.sh
+new file mode 100755
+index 0000000..6de4c85
+--- /dev/null
++++ b/scripts/grafana-up.sh
+@@ -0,0 +1,77 @@
++#!/bin/sh
++# Install the Grafana stack into the kind cluster from scripts/cluster-up.sh, in namespace monitoring (kept apart from
++# the workloads the agent triages): Prometheus with kube-state-metrics, Loki with Alloy shipping every pod's logs, Grafana
++# with both as datasources, and mcp-grafana (read-only). Charts and values: k8s/grafana.
++# Upgrades the releases if they are already installed. Remove them with scripts/grafana-down.sh.
++#
++#   scripts/grafana-up.sh
++#   KIND_DEV_CLUSTER_NAME=my-cluster KIND_DEV_KUBECONFIG=/tmp/my.kubeconfig scripts/grafana-up.sh
++#
++# Then:
++#   kubectl --kubeconfig .cache/kind-dev.kubeconfig -n monitoring port-forward svc/grafana 3000:80    # admin/admin
++#   kubectl --kubeconfig .cache/kind-dev.kubeconfig -n monitoring port-forward svc/grafana-mcp 8000   # /mcp
++set -eu
++set -x
++cd "$(dirname "$0")/.."
++
++CLUSTER=${KIND_DEV_CLUSTER_NAME:-k8-triage-dev}
++export KUBECONFIG=${KIND_DEV_KUBECONFIG:-$PWD/.cache/kind-dev.kubeconfig}
++NAMESPACE=monitoring
++
++for tool in docker kind kubectl helm; do
++  command -v "$tool" >/dev/null || { echo "error: $tool is not installed" >&2; exit 1; }
++done
++if ! kubectl cluster-info >/dev/null 2>&1; then
++  echo "error: no cluster at $KUBECONFIG; run scripts/cluster-up.sh first" >&2
++  exit 1
++fi
++
++# The kind node pulls one image at a time and starts from an empty cache with every new cluster, so the Grafana and
++# Prometheus images alone took 10+ minutes. Load them from the local Docker cache instead (pulled there once).
++# Left out: images pinned by digest (kind load can't satisfy those; the kubelet pulls them), bats (helm test only)
++# and thanos (only with Thanos enabled).
++echo "==> Loading the stack's images into kind from the local Docker cache"
++images=$(
++  while read -r release repo version; do
++    case $release in ""|\#*) continue ;; esac
++    helm template "$release" "$release" --repo "$repo" --version "$version" \
++      --namespace "$NAMESPACE" --values "k8s/grafana/$release.yaml"
++  done < k8s/grafana/charts.txt \
++    | grep -oE '(image: *"?|=)(docker\.io|quay\.io|ghcr\.io|registry\.k8s\.io)/[^" ,]+' \
++    | sed -E 's/^(image: *"?|=)//' \
++    | grep -vE '@|/bats/|/thanos/' \
++    | sort -u
++)
++# Not `kind load docker-image`: with Docker's containerd image store, `docker save` writes the multi-platform index but
++# only this platform's layers, and kind's `ctr import --all-platforms` fails on the missing ones
++# ("content digest sha256:...: not found"). So save just this platform and import that the way kind does.
++platform=$(docker version --format '{{.Server.Os}}/{{.Server.Arch}}')
++for image in $images; do
++  docker image inspect "$image" >/dev/null 2>&1 || docker pull -q --platform "$platform" "$image"
++  for node in $(kind get nodes --name "$CLUSTER"); do
++    docker save --platform "$platform" "$image" \
++      | docker exec -i "$node" ctr --namespace=k8s.io images import --digests --snapshotter=overlayfs - >/dev/null
++  done
++done
++
++echo "==> Installing the Grafana stack into namespace $NAMESPACE (a few minutes)"
++pids=""
++while read -r release repo version; do
++  case $release in ""|\#*) continue ;; esac
++  helm upgrade --install "$release" "$release" --repo "$repo" --version "$version" \
++    --namespace "$NAMESPACE" --create-namespace \
++    --values "k8s/grafana/$release.yaml" --wait --timeout 10m &
++  pids="$pids $!"
++done < k8s/grafana/charts.txt
++failed=0
++for pid in $pids; do wait "$pid" || failed=1; done
++if [ "$failed" -ne 0 ]; then
++  echo "error: a Helm install failed (see above)" >&2
++  exit 1
++fi
++
++kubectl -n "$NAMESPACE" get deployments,statefulsets,pods
++echo
++echo "Ready. Kubeconfig: $KUBECONFIG"
++echo "  kubectl --kubeconfig $KUBECONFIG -n $NAMESPACE port-forward svc/grafana 3000:80    # http://localhost:3000, admin/admin"
++echo "  kubectl --kubeconfig $KUBECONFIG -n $NAMESPACE port-forward svc/grafana-mcp 8000   # http://127.0.0.1:8000/mcp"
+diff --git a/scripts/load-test.sh b/scripts/load-test.sh
+new file mode 100755
+index 0000000..c01494a
+--- /dev/null
++++ b/scripts/load-test.sh
+@@ -0,0 +1,109 @@
++#!/bin/sh
++# Load test with ApacheBench (ab), in one of two ways:
++#
++# - With a URL: REQUESTS GETs to URL, CONCURRENCY at a time, then a summary of status codes, throughput and latency
++#   percentiles. Uses a local `ab` (apt install apache2-utils), else the one in the httpd Docker image. For flaky-web,
++#   forward its port first: kubectl --kubeconfig .cache/kind-dev.kubeconfig port-forward svc/flaky-web 8080
++#
++#     scripts/load-test.sh http://localhost:8080/                       # 200 requests, 10 at a time
++#     REQUESTS=1000 CONCURRENCY=50 scripts/load-test.sh http://localhost:8080/
++#
++# - Without a URL: against flaky-web (scripts/flaky-web-up.sh) from inside the kind cluster. Builds this script into
++#   the load-test image (scripts/load-test/Dockerfile), loads it into kind, starts a new Job (scripts/load-test/job.yaml,
++#   which runs this script with flaky-web's URL) and follows its output until it ends. REQUESTS, CONCURRENCY and
++#   TIMEOUT override the Job's defaults (500, 20, 60s). Finished Jobs are deleted after an hour.
++#
++#     scripts/load-test.sh
++#     REQUESTS=2000 CONCURRENCY=50 scripts/load-test.sh
++#     KIND_DEV_CLUSTER_NAME=my-cluster KIND_DEV_KUBECONFIG=/tmp/my.kubeconfig scripts/load-test.sh
++#
++# ab aborts the whole run when a request exceeds its timeout, so TIMEOUT must be longer than the server's slowest
++# answer (flaky-web: TIMEOUT_SECONDS, default 30). Hanging requests then show up as non-2xx (504) and in the latency tail.
++set -eu
++
++run_ab() {
++  url=$1
++  requests=${REQUESTS:-200}
++  concurrency=${CONCURRENCY:-10}
++  timeout=${TIMEOUT:-60}  # seconds ab waits for a response before aborting the run
++
++  if command -v ab >/dev/null; then
++    set -- ab
++  elif command -v docker >/dev/null; then
++    set -- docker run --rm --network host httpd:2.4-alpine ab  # host network: localhost is this machine
++  else
++    echo "error: needs ab (apt install apache2-utils) or docker" >&2
++    exit 1
++  fi
++
++  echo "Load testing $url: $requests requests, $concurrency concurrent, ${timeout}s timeout"
++  # -l: don't count a different body length (the 504's) as a failed request; -r: don't stop on socket errors
++  status=0
++  output=$("$@" -n "$requests" -c "$concurrency" -s "$timeout" -l -r "$url" 2>&1) || status=$?
++  printf '%s\n' "$output" | grep -E \
++    'Complete requests|Failed requests|Non-2xx responses|Time taken|Requests per second|Time per request:.*\(mean\)|^ +(50|90|95|99|100)%|apr_|requests completed' \
++    || printf '%s\n' "$output"
++  if [ "$status" -ne 0 ]; then
++    echo "error: ab aborted (exit $status); if a request timed out, raise TIMEOUT above the server's slowest answer" >&2
++  fi
++  exit "$status"
++}
++
++run_job() {
++  set -x
++  cd "$(dirname "$0")/.."
++  cluster=${KIND_DEV_CLUSTER_NAME:-k8-triage-dev}
++  export KUBECONFIG=${KIND_DEV_KUBECONFIG:-$PWD/.cache/kind-dev.kubeconfig}
++  image=load-test:dev
++
++  for tool in docker kind kubectl; do
++    command -v "$tool" >/dev/null || { echo "error: $tool is not installed" >&2; exit 1; }
++  done
++  if ! kubectl cluster-info >/dev/null 2>&1; then
++    echo "error: no cluster at $KUBECONFIG; run scripts/cluster-up.sh first" >&2
++    exit 1
++  fi
++  if ! kubectl get deployment flaky-web >/dev/null 2>&1; then
++    echo "error: flaky-web is not deployed; run scripts/flaky-web-up.sh first" >&2
++    exit 1
++  fi
++
++  echo "==> Building $image and loading it into kind"
++  docker build -q -t "$image" -f scripts/load-test/Dockerfile .
++  # Not `kind load docker-image`: with Docker's containerd image store it can fail on layers of other platforms
++  # (see scripts/grafana-up.sh).
++  platform=$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$image")
++  for node in $(kind get nodes --name "$cluster"); do
++    docker save --platform "$platform" "$image" \
++      | docker exec -i "$node" ctr --namespace=k8s.io images import --digests --snapshotter=overlayfs - >/dev/null
++  done
++
++  echo "==> Starting the load test"
++  overrides=""
++  for name in REQUESTS CONCURRENCY TIMEOUT; do
++    eval "value=\${$name:-}"
++    [ -n "$value" ] && overrides="$overrides $name=$value"
++  done
++  if [ -n "$overrides" ]; then
++    # shellcheck disable=SC2086 # one argument per override
++    job=$(kubectl set env --local -f scripts/load-test/job.yaml $overrides -o yaml | kubectl create -f - -o name)
++  else
++    job=$(kubectl create -f scripts/load-test/job.yaml -o name)
++  fi
++  kubectl wait --for=condition=ready pod -l "batch.kubernetes.io/job-name=${job#*/}" --timeout=120s
++  kubectl logs -f "$job"
++
++  # The pod's exit code (ab's) decides whether the Job completed or failed.
++  if kubectl wait --for=condition=complete "$job" --timeout=30s >/dev/null 2>&1; then
++    echo "Load test $job completed"
++  else
++    echo "error: load test $job failed: kubectl describe $job" >&2
++    exit 1
++  fi
++}
++
++if [ $# -gt 0 ]; then
++  run_ab "$1"
++else
++  run_job
++fi
+diff --git a/scripts/load-test/Dockerfile b/scripts/load-test/Dockerfile
+new file mode 100644
+index 0000000..ac80b7f
+--- /dev/null
++++ b/scripts/load-test/Dockerfile
+@@ -0,0 +1,8 @@
++# scripts/load-test.sh with ApacheBench. Build from the repo root, so the script is in the build context:
++#
++#   docker build -t load-test:dev -f scripts/load-test/Dockerfile .   (or just scripts/load-test.sh, without a URL)
++FROM alpine:3.22
++RUN apk add --no-cache apache2-utils
++COPY scripts/load-test.sh /usr/local/bin/load-test
++USER 65534
++ENTRYPOINT ["load-test"]
+diff --git a/scripts/load-test/job.yaml b/scripts/load-test/job.yaml
+new file mode 100644
+index 0000000..d4381b8
+--- /dev/null
++++ b/scripts/load-test/job.yaml
+@@ -0,0 +1,28 @@
++# Runs scripts/load-test.sh (ab) once against flaky-web from inside the cluster. generateName gives every run its
++# own Job, so it is created, not applied (apply doesn't support generateName). Build, load and run it with
++# scripts/load-test.sh (without a URL).
++apiVersion: batch/v1
++kind: Job
++metadata:
++  generateName: load-test-
++  namespace: default
++  labels: {app: load-test}
++spec:
++  backoffLimit: 0  # a load test that failed shouldn't silently run again
++  ttlSecondsAfterFinished: 3600
++  template:
++    metadata: {labels: {app: load-test}}
++    spec:
++      restartPolicy: Never
++      containers:
++        - name: load-test
++          image: load-test:dev
++          imagePullPolicy: Never  # loaded into kind, not in a registry
++          args: ["http://flaky-web:8080/"]
++          env:
++            - {name: REQUESTS, value: "500"}
++            - {name: CONCURRENCY, value: "20"}
++            - {name: TIMEOUT, value: "60"}  # above flaky-web's 30s hang, or ab aborts the run
++          resources:
++            requests: {cpu: 50m, memory: 16Mi}
++            limits: {memory: 64Mi}
+-- 
+2.53.0
+
