@@ -1,0 +1,703 @@
+From d32124b97d0574dbf28e581ddf21514c8be10d1a Mon Sep 17 00:00:00 2001
+From: Kevin Per <kevin.per@ebcont.com>
+Date: Tue, 13 Oct 2026 11:18:57 +0200
+Subject: [PATCH 11/11] Propose fixes for broken workloads
+
+---
+ scripts/flaky-web/k8s.yaml                    |   2 +
+ .../java/com/ebcont/k8/triage/FixAgent.java   | 102 +++++++++
+ .../com/ebcont/k8/triage/FixCandidate.java    |  19 ++
+ .../ebcont/k8/triage/GitHubRepository.java    |  67 ++++++
+ .../com/ebcont/k8/triage/RootCauseAgent.java  |   4 +
+ .../ebcont/k8/triage/SourceRepositories.java  |  48 +++++
+ .../com/ebcont/k8/triage/TriageRunner.java    |   1 +
+ .../com/ebcont/k8/triage/TriageWorkers.java   |  23 +-
+ src/main/resources/application.properties     |   2 +
+ src/main/resources/bpmn/k8-triage.bpmn        | 203 ++++++++++++++----
+ src/main/resources/bpmn/review-fix.form       |  36 ++++
+ 11 files changed, 468 insertions(+), 39 deletions(-)
+ create mode 100644 src/main/java/com/ebcont/k8/triage/FixAgent.java
+ create mode 100644 src/main/java/com/ebcont/k8/triage/FixCandidate.java
+ create mode 100644 src/main/java/com/ebcont/k8/triage/GitHubRepository.java
+ create mode 100644 src/main/java/com/ebcont/k8/triage/SourceRepositories.java
+ create mode 100644 src/main/resources/bpmn/review-fix.form
+
+diff --git a/scripts/flaky-web/k8s.yaml b/scripts/flaky-web/k8s.yaml
+index 2f60997..9fc5563 100644
+--- a/scripts/flaky-web/k8s.yaml
++++ b/scripts/flaky-web/k8s.yaml
+@@ -5,6 +5,8 @@ metadata:
+   name: flaky-web
+   namespace: default
+   labels: {app: flaky-web}
++  annotations:
++    triage.ebcont.com/repository: https://github.com/kper/demo_kubernetes_ai_investigator_flaky_web
+ spec:
+   replicas: 1
+   selector: {matchLabels: {app: flaky-web}}
+diff --git a/src/main/java/com/ebcont/k8/triage/FixAgent.java b/src/main/java/com/ebcont/k8/triage/FixAgent.java
+new file mode 100644
+index 0000000..abe7d48
+--- /dev/null
++++ b/src/main/java/com/ebcont/k8/triage/FixAgent.java
+@@ -0,0 +1,102 @@
++package com.ebcont.k8.triage;
++
++import org.springframework.ai.chat.client.ChatClient;
++import org.springframework.beans.factory.annotation.Value;
++import org.springframework.stereotype.Component;
++
++import java.io.IOException;
++import java.io.UncheckedIOException;
++import java.net.http.HttpClient;
++import java.time.Duration;
++import java.util.List;
++import java.util.Objects;
++import java.util.regex.Pattern;
++import java.util.stream.Collectors;
++
++/**
++ * Proposes a code fix for a finding in the deployment's source repository, as Markdown with a unified diff. The
++ * repository's source is fetched from GitHub up front and sent with the request: the model gets no tools.
++ */
++@Component
++public class FixAgent {
++
++    static final String FIX_PROMPT = """
++            You are the engineer who owns this repository. A Kubernetes triage found a problem in a workload built from
++            it. Propose a fix in its source code. The message contains the repository's file list and the content of
++            its source files; base your change only on that content.
++            Make the smallest change that removes the root cause, not just its symptom. Do not hide errors or remove
++            logging or metrics. Keep the code's style, and add or adjust tests if the repository has them.
++            If the problem is only configuration (e.g. environment variables of the deployment), say so and propose
++            that change instead of a code change.
++            Reply in Markdown with exactly these sections:
++            ## Summary
++            ## Why this fixes the root cause
++            ## Change
++            One ```diff block with a unified diff against the files in the message, with paths from the repository
++            root (a/... and b/...), that applies with `git apply`.
++            ## Configuration
++            Changes to the deployment or its environment, or "None".
++            ## Verification
++            ## Risks
++            """;
++
++    /** Not sent: lock files, binaries and vendored or generated files don't help to write a fix. */
++    private static final Pattern SKIPPED = Pattern.compile(
++            "(?i).*(\\.lock|lock\\.json|\\.(png|jpe?g|gif|ico|svg|pdf|zip|gz|jar|class|so|dll|exe|bin))$|(^|/)(vendor|node_modules|target|dist|build)/.*");
++    private static final long MAX_FILE_BYTES = 50 * 1024;
++    private static final long MAX_TOTAL_BYTES = 200 * 1024;
++
++    private final ChatClient chatClient;
++    private final HttpClient http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10))
++            .followRedirects(HttpClient.Redirect.NORMAL).build();
++    private final String githubToken;
++
++    public FixAgent(ChatClient.Builder builder, @Value("${triage.github.token:}") String githubToken) {
++        this.chatClient = builder.defaultSystem(FIX_PROMPT).build();
++        this.githubToken = githubToken;
++    }
++
++    public String propose(FixCandidate fix) {
++        String answer = chatClient.prompt()
++                .user("""
++                        Repository: %s (ref %s)
++                        Workload: deployment %s
++
++                        Symptom: %s
++                        Root cause: %s
++                        Fix suggested by the root cause analysis: %s
++
++                        %s""".formatted(fix.repository(), fix.ref(), fix.key(), fix.symptom(), fix.rootCause(),
++                        fix.suggestedFix(), source(new GitHubRepository(fix.sourceRepository(), http, githubToken))))
++                .call()
++                .content();
++        // gpt-oss sometimes ends with reasoning only and no text.
++        return Objects.requireNonNullElse(answer, "(no proposal: the model returned no text)");
++    }
++
++    /** The repository's file list and the content of its source files, as Markdown. */
++    static String source(GitHubRepository repository) {
++        try {
++            List<GitHubRepository.File> files = repository.files();
++            StringBuilder sb = new StringBuilder("## Files\n\n")
++                    .append(files.stream().map(f -> f.path() + "  " + f.size() + " bytes").collect(Collectors.joining("\n")))
++                    .append("\n\n## Source\n");
++            long total = 0;
++            for (GitHubRepository.File file : files) {
++                if (SKIPPED.matcher(file.path()).matches() || file.size() > MAX_FILE_BYTES) {
++                    continue;
++                }
++                if (total + file.size() > MAX_TOTAL_BYTES) {
++                    sb.append("\n(further files left out: size limit)\n");
++                    break;
++                }
++                total += file.size();
++                sb.append("\n### ").append(file.path()).append("\n````\n").append(repository.read(file.path()))
++                        .append("\n````\n");
++            }
++            return sb.toString();
++        } catch (IOException e) {
++            throw new UncheckedIOException("Reading the source repository failed", e);
++        }
++    }
++}
+diff --git a/src/main/java/com/ebcont/k8/triage/FixCandidate.java b/src/main/java/com/ebcont/k8/triage/FixCandidate.java
+new file mode 100644
+index 0000000..ab5bed7
+--- /dev/null
++++ b/src/main/java/com/ebcont/k8/triage/FixCandidate.java
+@@ -0,0 +1,19 @@
++package com.ebcont.k8.triage;
++
++/**
++ * A finding whose deployment has a source repository, as process variable {@code fix} of one "Propose fix" subprocess.
++ * {@code key} is "namespace/deployment".
++ */
++public record FixCandidate(String key, String namespace, String deployment, String repository, String owner,
++                           String name, String ref, String symptom, String rootCause, String suggestedFix) {
++
++    static FixCandidate of(RootCauseReport.Finding finding, SourceRepositories.Repository repository) {
++        return new FixCandidate(finding.namespace() + "/" + finding.deployment(), finding.namespace(),
++                finding.deployment(), repository.url(), repository.owner(), repository.name(), repository.ref(),
++                finding.symptom(), finding.rootCause(), finding.fix());
++    }
++
++    SourceRepositories.Repository sourceRepository() {
++        return new SourceRepositories.Repository(repository, owner, name, ref);
++    }
++}
+diff --git a/src/main/java/com/ebcont/k8/triage/GitHubRepository.java b/src/main/java/com/ebcont/k8/triage/GitHubRepository.java
+new file mode 100644
+index 0000000..b3edbcf
+--- /dev/null
++++ b/src/main/java/com/ebcont/k8/triage/GitHubRepository.java
+@@ -0,0 +1,67 @@
++package com.ebcont.k8.triage;
++
++import tools.jackson.databind.JsonNode;
++import tools.jackson.databind.json.JsonMapper;
++
++import java.io.IOException;
++import java.net.URI;
++import java.net.http.HttpClient;
++import java.net.http.HttpRequest;
++import java.net.http.HttpResponse;
++import java.time.Duration;
++import java.util.List;
++import java.util.stream.StreamSupport;
++
++/**
++ * Reads one GitHub repository for the {@link FixAgent}: its file list and file contents. Public repositories need no
++ * token (60 requests/hour).
++ */
++public class GitHubRepository {
++
++    public record File(String path, long size) {
++    }
++
++    private static final Duration TIMEOUT = Duration.ofSeconds(30);
++
++    private final SourceRepositories.Repository repository;
++    private final HttpClient http;
++    private final String token;
++
++    public GitHubRepository(SourceRepositories.Repository repository, HttpClient http, String token) {
++        this.repository = repository;
++        this.http = http;
++        this.token = token;
++    }
++
++    /** Every file in the repository, with its size in bytes. */
++    public List<File> files() throws IOException {
++        JsonNode tree = JsonMapper.shared().readTree(get("https://api.github.com/repos/" + repository.owner() + "/"
++                + repository.name() + "/git/trees/" + repository.ref() + "?recursive=1"));
++        return StreamSupport.stream(tree.path("tree").spliterator(), false)
++                .filter(entry -> "blob".equals(entry.path("type").asString()))
++                .map(entry -> new File(entry.path("path").asString(), entry.path("size").asLong()))
++                .toList();
++    }
++
++    public String read(String path) throws IOException {
++        return get("https://raw.githubusercontent.com/" + repository.owner() + "/" + repository.name() + "/"
++                + repository.ref() + "/" + path);
++    }
++
++    private String get(String url) throws IOException {
++        HttpRequest.Builder request = HttpRequest.newBuilder(URI.create(url)).timeout(TIMEOUT).GET();
++        if (token != null && !token.isBlank()) {
++            request.header("Authorization", "Bearer " + token);
++        }
++        try {
++            HttpResponse<String> response = http.send(request.build(), HttpResponse.BodyHandlers.ofString());
++            if (response.statusCode() != 200) {
++                throw new IOException("GET " + url + " returned HTTP " + response.statusCode());
++            }
++            return response.body();
++        } catch (InterruptedException e) {
++            Thread.currentThread().interrupt();
++            throw new IOException("interrupted", e);
++        }
++    }
++}
+diff --git a/src/main/java/com/ebcont/k8/triage/RootCauseAgent.java b/src/main/java/com/ebcont/k8/triage/RootCauseAgent.java
+index 5807d96..e816c34 100644
+--- a/src/main/java/com/ebcont/k8/triage/RootCauseAgent.java
++++ b/src/main/java/com/ebcont/k8/triage/RootCauseAgent.java
+@@ -12,6 +12,10 @@ public class RootCauseAgent {
+             collected from Kubernetes. Using only that evidence, write a short report: for each
+             unhealthy workload, give the symptom, the root cause with the evidence that proves it,
+             and a concrete fix. Say so if the evidence is insufficient.
++            When the fault is in the application's own behaviour (e.g. requests that hang, wrong status codes, bad
++            defaults) rather than in its deployment, state the misbehaviour exactly in the root cause: the endpoint,
++            status codes, timings, the share of failed requests and the relevant configuration (environment variable
++            names and values, if known). A separate agent will fix the source code from that description.
+             """;
+ 
+     private static final String ROLLBACK_INSTRUCTIONS = """
+diff --git a/src/main/java/com/ebcont/k8/triage/SourceRepositories.java b/src/main/java/com/ebcont/k8/triage/SourceRepositories.java
+new file mode 100644
+index 0000000..17397b3
+--- /dev/null
++++ b/src/main/java/com/ebcont/k8/triage/SourceRepositories.java
+@@ -0,0 +1,48 @@
++package com.ebcont.k8.triage;
++
++import io.fabric8.kubernetes.api.model.apps.Deployment;
++import io.fabric8.kubernetes.client.KubernetesClient;
++import org.springframework.stereotype.Component;
++
++import java.util.Map;
++import java.util.Optional;
++import java.util.regex.Matcher;
++import java.util.regex.Pattern;
++
++/**
++ * Finds a deployment's source repository from its annotations, e.g. in scripts/flaky-web/k8s.yaml:
++ * {@code triage.ebcont.com/repository: https://github.com/<owner>/<name>} and optionally {@code triage.ebcont.com/ref}.
++ */
++@Component
++public class SourceRepositories {
++
++    static final String REPOSITORY_ANNOTATION = "triage.ebcont.com/repository";
++    static final String REF_ANNOTATION = "triage.ebcont.com/ref";
++    private static final Pattern GITHUB_URL = Pattern.compile("https://github\\.com/([\\w.-]+)/([\\w.-]+?)(?:\\.git)?/?");
++
++    /** A GitHub repository; ref "HEAD" is its default branch. */
++    public record Repository(String url, String owner, String name, String ref) {
++    }
++
++    private final KubernetesClient client;
++
++    public SourceRepositories(KubernetesClient client) {
++        this.client = client;
++    }
++
++    /** The deployment's repository, or empty if it has no (GitHub) repository annotation or doesn't exist. */
++    public Optional<Repository> of(String namespace, String deployment) {
++        Deployment d = client.apps().deployments().inNamespace(namespace).withName(deployment).get();
++        if (d == null || d.getMetadata().getAnnotations() == null) {
++            return Optional.empty();
++        }
++        Map<String, String> annotations = d.getMetadata().getAnnotations();
++        String url = annotations.get(REPOSITORY_ANNOTATION);
++        Matcher matcher = url == null ? null : GITHUB_URL.matcher(url.trim());
++        if (matcher == null || !matcher.matches()) {
++            return Optional.empty();
++        }
++        return Optional.of(new Repository("https://github.com/" + matcher.group(1) + "/" + matcher.group(2),
++                matcher.group(1), matcher.group(2), annotations.getOrDefault(REF_ANNOTATION, "HEAD")));
++    }
++}
+diff --git a/src/main/java/com/ebcont/k8/triage/TriageRunner.java b/src/main/java/com/ebcont/k8/triage/TriageRunner.java
+index 4117d42..b688cb8 100644
+--- a/src/main/java/com/ebcont/k8/triage/TriageRunner.java
++++ b/src/main/java/com/ebcont/k8/triage/TriageRunner.java
+@@ -41,6 +41,7 @@ public class TriageRunner implements CommandLineRunner {
+         client.newDeployResourceCommand()
+                 .addResourceFromClasspath("bpmn/k8-triage.bpmn")
+                 .addResourceFromClasspath("bpmn/approve-rollback.form")
++                .addResourceFromClasspath("bpmn/review-fix.form")
+                 .send().join();
+ 
+         long processInstanceKey = client.newCreateInstanceCommand()
+diff --git a/src/main/java/com/ebcont/k8/triage/TriageWorkers.java b/src/main/java/com/ebcont/k8/triage/TriageWorkers.java
+index cb9126c..81a54ef 100644
+--- a/src/main/java/com/ebcont/k8/triage/TriageWorkers.java
++++ b/src/main/java/com/ebcont/k8/triage/TriageWorkers.java
+@@ -23,11 +23,16 @@ public class TriageWorkers {
+     private final InvestigatorAgent investigator;
+     private final RootCauseAgent rootCause;
+     private final RollbackTools rollbackTools;
++    private final SourceRepositories sourceRepositories;
++    private final FixAgent fixAgent;
+ 
+-    public TriageWorkers(InvestigatorAgent investigator, RootCauseAgent rootCause, RollbackTools rollbackTools) {
++    public TriageWorkers(InvestigatorAgent investigator, RootCauseAgent rootCause, RollbackTools rollbackTools,
++                         SourceRepositories sourceRepositories, FixAgent fixAgent) {
+         this.investigator = investigator;
+         this.rootCause = rootCause;
+         this.rollbackTools = rollbackTools;
++        this.sourceRepositories = sourceRepositories;
++        this.fixAgent = fixAgent;
+     }
+ 
+     @JobWorker(type = "investigate", timeout = LLM_TIMEOUT_MS, fetchVariables = "namespaces")
+@@ -51,7 +56,21 @@ public class TriageWorkers {
+                 .filter(Objects::nonNull)
+                 .toList();
+         log.info("{} rollback(s) waiting for approval in Tasklist: http://localhost:8080/tasklist", rollbacks.size());
+-        return Map.of("report", report, "rollbacks", rollbacks);
++        List<FixCandidate> fixes = report.findings().stream()
++                .flatMap(finding -> sourceRepositories.of(finding.namespace(), finding.deployment()).stream()
++                        .map(repository -> FixCandidate.of(finding, repository)))
++                .toList();
++        log.info("Proposing code fixes for {}", fixes.stream().map(FixCandidate::key).toList());
++        return Map.of("report", report, "rollbacks", rollbacks, "fixes", fixes);
++    }
++
++    @JobWorker(type = "propose-fix", timeout = LLM_TIMEOUT_MS, fetchVariables = "fix")
++    public Map<String, Object> proposeFix(@Variable("fix") FixCandidate fix) {
++        log.info("Proposing a fix for {} in {}", fix.key(), fix.repository());
++        String proposal = fixAgent.propose(fix);
++        log.info("Fix proposal for {}, waiting for review in Tasklist: http://localhost:8080/tasklist\n{}",
++                fix.key(), proposal);
++        return Map.of("fixProposal", proposal);
+     }
+ 
+     @JobWorker(type = "rollback-deployment", fetchVariables = {"rollback", "comment"})
+diff --git a/src/main/resources/application.properties b/src/main/resources/application.properties
+index 2a5ebe7..361564a 100644
+--- a/src/main/resources/application.properties
++++ b/src/main/resources/application.properties
+@@ -21,3 +21,5 @@ triage.grafana=false
+ spring.ai.mcp.client.enabled=${triage.grafana:false}
+ spring.ai.mcp.client.streamable-http.connections.grafana.url=http://localhost:8000
+ spring.ai.mcp.client.streamable-http.connections.grafana.endpoint=/mcp
++
++triage.github.token=${GITHUB_TOKEN:}
+diff --git a/src/main/resources/bpmn/k8-triage.bpmn b/src/main/resources/bpmn/k8-triage.bpmn
+index fe28f43..6972b20 100644
+--- a/src/main/resources/bpmn/k8-triage.bpmn
++++ b/src/main/resources/bpmn/k8-triage.bpmn
+@@ -27,8 +27,14 @@
+         <zeebe:taskDefinition type="analyse-root-cause" retries="2" />
+       </bpmn:extensionElements>
+       <bpmn:incoming>Flow_ToAnalyse</bpmn:incoming>
+-      <bpmn:outgoing>Flow_ToGateway</bpmn:outgoing>
++      <bpmn:outgoing>Flow_ToFork</bpmn:outgoing>
+     </bpmn:serviceTask>
++    <!-- Rollbacks and code fixes are decided independently, in parallel. -->
++    <bpmn:parallelGateway id="Gateway_Fork">
++      <bpmn:incoming>Flow_ToFork</bpmn:incoming>
++      <bpmn:outgoing>Flow_ToGateway</bpmn:outgoing>
++      <bpmn:outgoing>Flow_ToFixGateway</bpmn:outgoing>
++    </bpmn:parallelGateway>
+     <bpmn:exclusiveGateway id="Gateway_HasRollbacks" name="Rollbacks proposed?" default="Flow_NoRollbacks">
+       <bpmn:incoming>Flow_ToGateway</bpmn:incoming>
+       <bpmn:outgoing>Flow_HasRollbacks</bpmn:outgoing>
+@@ -88,20 +94,79 @@
+       <bpmn:sequenceFlow id="Flow_Rejected" name="no" sourceRef="Gateway_Approved" targetRef="EndEvent_Rejected" />
+       <bpmn:sequenceFlow id="Flow_ToRolledBack" sourceRef="Task_Rollback" targetRef="EndEvent_RolledBack" />
+     </bpmn:subProcess>
+-    <bpmn:endEvent id="EndEvent_Done" name="Triage finished">
++    <bpmn:exclusiveGateway id="Gateway_HasFixes" name="Source repositories known?" default="Flow_NoFixes">
++      <bpmn:incoming>Flow_ToFixGateway</bpmn:incoming>
++      <bpmn:outgoing>Flow_HasFixes</bpmn:outgoing>
++      <bpmn:outgoing>Flow_NoFixes</bpmn:outgoing>
++    </bpmn:exclusiveGateway>
++    <bpmn:subProcess id="SubProcess_Fix" name="Propose code fix">
++      <bpmn:extensionElements>
++        <!-- Local per fix, so parallel reviews don't overwrite each other's values. -->
++        <zeebe:ioMapping>
++          <zeebe:input source="=null" target="fixProposal" />
++          <zeebe:input source="=null" target="decision" />
++          <zeebe:input source="=null" target="comment" />
++        </zeebe:ioMapping>
++      </bpmn:extensionElements>
++      <bpmn:incoming>Flow_HasFixes</bpmn:incoming>
++      <bpmn:outgoing>Flow_FixesToJoin</bpmn:outgoing>
++      <bpmn:multiInstanceLoopCharacteristics>
++        <bpmn:extensionElements>
++          <zeebe:loopCharacteristics inputCollection="=fixes" inputElement="fix" />
++        </bpmn:extensionElements>
++      </bpmn:multiInstanceLoopCharacteristics>
++      <bpmn:startEvent id="StartEvent_FixNeeded" name="Fix needed">
++        <bpmn:outgoing>Flow_ToProposeFix</bpmn:outgoing>
++      </bpmn:startEvent>
++      <bpmn:serviceTask id="Task_ProposeFix" name="Propose fix">
++        <bpmn:extensionElements>
++          <zeebe:taskDefinition type="propose-fix" retries="2" />
++        </bpmn:extensionElements>
++        <bpmn:incoming>Flow_ToProposeFix</bpmn:incoming>
++        <bpmn:outgoing>Flow_ToReviewFix</bpmn:outgoing>
++      </bpmn:serviceTask>
++      <!-- Only records accept/reject for now; accepted fixes will become pull requests later. -->
++      <bpmn:userTask id="Task_ReviewFix" name="Review fix proposal">
++        <bpmn:extensionElements>
++          <zeebe:userTask />
++          <zeebe:formDefinition formId="review-fix" />
++        </bpmn:extensionElements>
++        <bpmn:incoming>Flow_ToReviewFix</bpmn:incoming>
++        <bpmn:outgoing>Flow_ToFixReviewed</bpmn:outgoing>
++      </bpmn:userTask>
++      <bpmn:endEvent id="EndEvent_FixReviewed" name="Fix reviewed">
++        <bpmn:incoming>Flow_ToFixReviewed</bpmn:incoming>
++      </bpmn:endEvent>
++      <bpmn:sequenceFlow id="Flow_ToProposeFix" sourceRef="StartEvent_FixNeeded" targetRef="Task_ProposeFix" />
++      <bpmn:sequenceFlow id="Flow_ToReviewFix" sourceRef="Task_ProposeFix" targetRef="Task_ReviewFix" />
++      <bpmn:sequenceFlow id="Flow_ToFixReviewed" sourceRef="Task_ReviewFix" targetRef="EndEvent_FixReviewed" />
++    </bpmn:subProcess>
++    <bpmn:parallelGateway id="Gateway_Join">
+       <bpmn:incoming>Flow_ToDone</bpmn:incoming>
+-    </bpmn:endEvent>
+-    <bpmn:endEvent id="EndEvent_NoRollbacks" name="Nothing to roll back">
+       <bpmn:incoming>Flow_NoRollbacks</bpmn:incoming>
++      <bpmn:incoming>Flow_FixesToJoin</bpmn:incoming>
++      <bpmn:incoming>Flow_NoFixes</bpmn:incoming>
++      <bpmn:outgoing>Flow_JoinToDone</bpmn:outgoing>
++    </bpmn:parallelGateway>
++    <bpmn:endEvent id="EndEvent_Done" name="Triage finished">
++      <bpmn:incoming>Flow_JoinToDone</bpmn:incoming>
+     </bpmn:endEvent>
+     <bpmn:sequenceFlow id="Flow_ToInvestigate" sourceRef="StartEvent_Requested" targetRef="Task_Investigate" />
+     <bpmn:sequenceFlow id="Flow_ToAnalyse" sourceRef="Task_Investigate" targetRef="Task_Analyse" />
+-    <bpmn:sequenceFlow id="Flow_ToGateway" sourceRef="Task_Analyse" targetRef="Gateway_HasRollbacks" />
++    <bpmn:sequenceFlow id="Flow_ToFork" sourceRef="Task_Analyse" targetRef="Gateway_Fork" />
++    <bpmn:sequenceFlow id="Flow_ToGateway" sourceRef="Gateway_Fork" targetRef="Gateway_HasRollbacks" />
++    <bpmn:sequenceFlow id="Flow_ToFixGateway" sourceRef="Gateway_Fork" targetRef="Gateway_HasFixes" />
+     <bpmn:sequenceFlow id="Flow_HasRollbacks" name="yes" sourceRef="Gateway_HasRollbacks" targetRef="SubProcess_Rollback">
+       <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">=count(rollbacks) &gt; 0</bpmn:conditionExpression>
+     </bpmn:sequenceFlow>
+-    <bpmn:sequenceFlow id="Flow_NoRollbacks" name="no" sourceRef="Gateway_HasRollbacks" targetRef="EndEvent_NoRollbacks" />
+-    <bpmn:sequenceFlow id="Flow_ToDone" sourceRef="SubProcess_Rollback" targetRef="EndEvent_Done" />
++    <bpmn:sequenceFlow id="Flow_NoRollbacks" name="no" sourceRef="Gateway_HasRollbacks" targetRef="Gateway_Join" />
++    <bpmn:sequenceFlow id="Flow_ToDone" sourceRef="SubProcess_Rollback" targetRef="Gateway_Join" />
++    <bpmn:sequenceFlow id="Flow_HasFixes" name="yes" sourceRef="Gateway_HasFixes" targetRef="SubProcess_Fix">
++      <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">=count(fixes) &gt; 0</bpmn:conditionExpression>
++    </bpmn:sequenceFlow>
++    <bpmn:sequenceFlow id="Flow_NoFixes" name="no" sourceRef="Gateway_HasFixes" targetRef="Gateway_Join" />
++    <bpmn:sequenceFlow id="Flow_FixesToJoin" sourceRef="SubProcess_Fix" targetRef="Gateway_Join" />
++    <bpmn:sequenceFlow id="Flow_JoinToDone" sourceRef="Gateway_Join" targetRef="EndEvent_Done" />
+   </bpmn:process>
+   <bpmndi:BPMNDiagram id="BPMNDiagram_k8_triage">
+     <bpmndi:BPMNPlane id="BPMNPlane_k8_triage" bpmnElement="k8-triage">
+@@ -114,35 +179,56 @@
+       <bpmndi:BPMNShape id="Shape_Task_Analyse" bpmnElement="Task_Analyse">
+         <dc:Bounds x="390" y="180" width="100" height="80" />
+       </bpmndi:BPMNShape>
+-      <bpmndi:BPMNShape id="Shape_Gateway_HasRollbacks" bpmnElement="Gateway_HasRollbacks" isMarkerVisible="true">
++      <bpmndi:BPMNShape id="Shape_Gateway_Fork" bpmnElement="Gateway_Fork">
+         <dc:Bounds x="545" y="195" width="50" height="50" />
+       </bpmndi:BPMNShape>
++      <bpmndi:BPMNShape id="Shape_Gateway_HasRollbacks" bpmnElement="Gateway_HasRollbacks" isMarkerVisible="true">
++        <dc:Bounds x="645" y="195" width="50" height="50" />
++      </bpmndi:BPMNShape>
+       <bpmndi:BPMNShape id="Shape_SubProcess_Rollback" bpmnElement="SubProcess_Rollback" isExpanded="true">
+-        <dc:Bounds x="650" y="100" width="620" height="250" />
++        <dc:Bounds x="750" y="100" width="620" height="250" />
+       </bpmndi:BPMNShape>
+       <bpmndi:BPMNShape id="Shape_StartEvent_Proposal" bpmnElement="StartEvent_Proposal">
+-        <dc:Bounds x="690" y="182" width="36" height="36" />
++        <dc:Bounds x="790" y="182" width="36" height="36" />
+       </bpmndi:BPMNShape>
+       <bpmndi:BPMNShape id="Shape_Task_Approve" bpmnElement="Task_Approve">
+-        <dc:Bounds x="780" y="160" width="100" height="80" />
++        <dc:Bounds x="880" y="160" width="100" height="80" />
+       </bpmndi:BPMNShape>
+       <bpmndi:BPMNShape id="Shape_Gateway_Approved" bpmnElement="Gateway_Approved" isMarkerVisible="true">
+-        <dc:Bounds x="935" y="175" width="50" height="50" />
++        <dc:Bounds x="1035" y="175" width="50" height="50" />
+       </bpmndi:BPMNShape>
+       <bpmndi:BPMNShape id="Shape_Task_Rollback" bpmnElement="Task_Rollback">
+-        <dc:Bounds x="1040" y="160" width="100" height="80" />
++        <dc:Bounds x="1140" y="160" width="100" height="80" />
+       </bpmndi:BPMNShape>
+       <bpmndi:BPMNShape id="Shape_EndEvent_RolledBack" bpmnElement="EndEvent_RolledBack">
+-        <dc:Bounds x="1192" y="182" width="36" height="36" />
++        <dc:Bounds x="1292" y="182" width="36" height="36" />
+       </bpmndi:BPMNShape>
+       <bpmndi:BPMNShape id="Shape_EndEvent_Rejected" bpmnElement="EndEvent_Rejected">
+-        <dc:Bounds x="1072" y="272" width="36" height="36" />
++        <dc:Bounds x="1172" y="272" width="36" height="36" />
+       </bpmndi:BPMNShape>
+-      <bpmndi:BPMNShape id="Shape_EndEvent_Done" bpmnElement="EndEvent_Done">
+-        <dc:Bounds x="1332" y="207" width="36" height="36" />
++      <bpmndi:BPMNShape id="Shape_Gateway_HasFixes" bpmnElement="Gateway_HasFixes" isMarkerVisible="true">
++        <dc:Bounds x="645" y="535" width="50" height="50" />
++      </bpmndi:BPMNShape>
++      <bpmndi:BPMNShape id="Shape_SubProcess_Fix" bpmnElement="SubProcess_Fix" isExpanded="true">
++        <dc:Bounds x="750" y="450" width="620" height="220" />
++      </bpmndi:BPMNShape>
++      <bpmndi:BPMNShape id="Shape_StartEvent_FixNeeded" bpmnElement="StartEvent_FixNeeded">
++        <dc:Bounds x="790" y="542" width="36" height="36" />
++      </bpmndi:BPMNShape>
++      <bpmndi:BPMNShape id="Shape_Task_ProposeFix" bpmnElement="Task_ProposeFix">
++        <dc:Bounds x="880" y="520" width="100" height="80" />
++      </bpmndi:BPMNShape>
++      <bpmndi:BPMNShape id="Shape_Task_ReviewFix" bpmnElement="Task_ReviewFix">
++        <dc:Bounds x="1040" y="520" width="100" height="80" />
++      </bpmndi:BPMNShape>
++      <bpmndi:BPMNShape id="Shape_EndEvent_FixReviewed" bpmnElement="EndEvent_FixReviewed">
++        <dc:Bounds x="1200" y="542" width="36" height="36" />
+       </bpmndi:BPMNShape>
+-      <bpmndi:BPMNShape id="Shape_EndEvent_NoRollbacks" bpmnElement="EndEvent_NoRollbacks">
+-        <dc:Bounds x="552" y="402" width="36" height="36" />
++      <bpmndi:BPMNShape id="Shape_Gateway_Join" bpmnElement="Gateway_Join">
++        <dc:Bounds x="1520" y="375" width="50" height="50" />
++      </bpmndi:BPMNShape>
++      <bpmndi:BPMNShape id="Shape_EndEvent_Done" bpmnElement="EndEvent_Done">
++        <dc:Bounds x="1622" y="382" width="36" height="36" />
+       </bpmndi:BPMNShape>
+       <bpmndi:BPMNEdge id="Edge_Flow_ToInvestigate" bpmnElement="Flow_ToInvestigate">
+         <di:waypoint x="188" y="220" />
+@@ -152,42 +238,85 @@
+         <di:waypoint x="340" y="220" />
+         <di:waypoint x="390" y="220" />
+       </bpmndi:BPMNEdge>
+-      <bpmndi:BPMNEdge id="Edge_Flow_ToGateway" bpmnElement="Flow_ToGateway">
++      <bpmndi:BPMNEdge id="Edge_Flow_ToFork" bpmnElement="Flow_ToFork">
+         <di:waypoint x="490" y="220" />
+         <di:waypoint x="545" y="220" />
+       </bpmndi:BPMNEdge>
+-      <bpmndi:BPMNEdge id="Edge_Flow_HasRollbacks" bpmnElement="Flow_HasRollbacks">
++      <bpmndi:BPMNEdge id="Edge_Flow_ToGateway" bpmnElement="Flow_ToGateway">
+         <di:waypoint x="595" y="220" />
+-        <di:waypoint x="650" y="220" />
++        <di:waypoint x="645" y="220" />
+       </bpmndi:BPMNEdge>
+-      <bpmndi:BPMNEdge id="Edge_Flow_NoRollbacks" bpmnElement="Flow_NoRollbacks">
++      <bpmndi:BPMNEdge id="Edge_Flow_ToFixGateway" bpmnElement="Flow_ToFixGateway">
+         <di:waypoint x="570" y="245" />
+-        <di:waypoint x="570" y="402" />
++        <di:waypoint x="570" y="560" />
++        <di:waypoint x="645" y="560" />
++      </bpmndi:BPMNEdge>
++      <bpmndi:BPMNEdge id="Edge_Flow_HasRollbacks" bpmnElement="Flow_HasRollbacks">
++        <di:waypoint x="695" y="220" />
++        <di:waypoint x="750" y="220" />
++      </bpmndi:BPMNEdge>
++      <bpmndi:BPMNEdge id="Edge_Flow_NoRollbacks" bpmnElement="Flow_NoRollbacks">
++        <di:waypoint x="670" y="245" />
++        <di:waypoint x="670" y="400" />
++        <di:waypoint x="1520" y="400" />
+       </bpmndi:BPMNEdge>
+       <bpmndi:BPMNEdge id="Edge_Flow_ToApprove" bpmnElement="Flow_ToApprove">
+-        <di:waypoint x="726" y="200" />
+-        <di:waypoint x="780" y="200" />
++        <di:waypoint x="826" y="200" />
++        <di:waypoint x="880" y="200" />
+       </bpmndi:BPMNEdge>
+       <bpmndi:BPMNEdge id="Edge_Flow_ToApproved" bpmnElement="Flow_ToApproved">
+-        <di:waypoint x="880" y="200" />
+-        <di:waypoint x="935" y="200" />
++        <di:waypoint x="980" y="200" />
++        <di:waypoint x="1035" y="200" />
+       </bpmndi:BPMNEdge>
+       <bpmndi:BPMNEdge id="Edge_Flow_Approved" bpmnElement="Flow_Approved">
+-        <di:waypoint x="985" y="200" />
+-        <di:waypoint x="1040" y="200" />
++        <di:waypoint x="1085" y="200" />
++        <di:waypoint x="1140" y="200" />
+       </bpmndi:BPMNEdge>
+       <bpmndi:BPMNEdge id="Edge_Flow_Rejected" bpmnElement="Flow_Rejected">
+-        <di:waypoint x="960" y="225" />
+-        <di:waypoint x="960" y="290" />
+-        <di:waypoint x="1072" y="290" />
++        <di:waypoint x="1060" y="225" />
++        <di:waypoint x="1060" y="290" />
++        <di:waypoint x="1172" y="290" />
+       </bpmndi:BPMNEdge>
+       <bpmndi:BPMNEdge id="Edge_Flow_ToRolledBack" bpmnElement="Flow_ToRolledBack">
+-        <di:waypoint x="1140" y="200" />
+-        <di:waypoint x="1192" y="200" />
++        <di:waypoint x="1240" y="200" />
++        <di:waypoint x="1292" y="200" />
+       </bpmndi:BPMNEdge>
+       <bpmndi:BPMNEdge id="Edge_Flow_ToDone" bpmnElement="Flow_ToDone">
+-        <di:waypoint x="1270" y="225" />
+-        <di:waypoint x="1332" y="225" />
++        <di:waypoint x="1370" y="225" />
++        <di:waypoint x="1545" y="225" />
++        <di:waypoint x="1545" y="375" />
++      </bpmndi:BPMNEdge>
++      <bpmndi:BPMNEdge id="Edge_Flow_HasFixes" bpmnElement="Flow_HasFixes">
++        <di:waypoint x="695" y="560" />
++        <di:waypoint x="750" y="560" />
++      </bpmndi:BPMNEdge>
++      <bpmndi:BPMNEdge id="Edge_Flow_NoFixes" bpmnElement="Flow_NoFixes">
++        <di:waypoint x="670" y="585" />
++        <di:waypoint x="670" y="710" />
++        <di:waypoint x="1490" y="710" />
++        <di:waypoint x="1490" y="400" />
++        <di:waypoint x="1520" y="400" />
++      </bpmndi:BPMNEdge>
++      <bpmndi:BPMNEdge id="Edge_Flow_ToProposeFix" bpmnElement="Flow_ToProposeFix">
++        <di:waypoint x="826" y="560" />
++        <di:waypoint x="880" y="560" />
++      </bpmndi:BPMNEdge>
++      <bpmndi:BPMNEdge id="Edge_Flow_ToReviewFix" bpmnElement="Flow_ToReviewFix">
++        <di:waypoint x="980" y="560" />
++        <di:waypoint x="1040" y="560" />
++      </bpmndi:BPMNEdge>
++      <bpmndi:BPMNEdge id="Edge_Flow_ToFixReviewed" bpmnElement="Flow_ToFixReviewed">
++        <di:waypoint x="1140" y="560" />
++        <di:waypoint x="1200" y="560" />
++      </bpmndi:BPMNEdge>
++      <bpmndi:BPMNEdge id="Edge_Flow_FixesToJoin" bpmnElement="Flow_FixesToJoin">
++        <di:waypoint x="1370" y="560" />
++        <di:waypoint x="1545" y="560" />
++        <di:waypoint x="1545" y="425" />
++      </bpmndi:BPMNEdge>
++      <bpmndi:BPMNEdge id="Edge_Flow_JoinToDone" bpmnElement="Flow_JoinToDone">
++        <di:waypoint x="1570" y="400" />
++        <di:waypoint x="1622" y="400" />
+       </bpmndi:BPMNEdge>
+     </bpmndi:BPMNPlane>
+   </bpmndi:BPMNDiagram>
+diff --git a/src/main/resources/bpmn/review-fix.form b/src/main/resources/bpmn/review-fix.form
+new file mode 100644
+index 0000000..a7fef5b
+--- /dev/null
++++ b/src/main/resources/bpmn/review-fix.form
+@@ -0,0 +1,36 @@
++{
++  "id": "review-fix",
++  "type": "default",
++  "executionPlatform": "Camunda Cloud",
++  "executionPlatformVersion": "8.9.0",
++  "schemaVersion": 18,
++  "components": [
++    {
++      "id": "Text_Finding",
++      "type": "text",
++      "text": "# Fix for {{fix.key}}\n\n**Repository:** {{fix.repository}} (ref {{fix.ref}})\n\n**Symptom:** {{fix.symptom}}\n\n**Root cause:** {{fix.rootCause}}"
++    },
++    {
++      "id": "Text_Proposal",
++      "type": "text",
++      "text": "{{fixProposal}}"
++    },
++    {
++      "id": "Radio_Decision",
++      "type": "radio",
++      "key": "decision",
++      "label": "Decision",
++      "validate": { "required": true },
++      "values": [
++        { "label": "Accept the fix (pull requests are not created yet)", "value": "accept" },
++        { "label": "Reject", "value": "reject" }
++      ]
++    },
++    {
++      "id": "Textarea_Comment",
++      "type": "textarea",
++      "key": "comment",
++      "label": "Comment"
++    }
++  ]
++}
+-- 
+2.53.0
+

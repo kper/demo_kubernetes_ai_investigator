@@ -1,7 +1,7 @@
 From 9dc04855a296649957f7491fe83aef36250bb338 Mon Sep 17 00:00:00 2001
 From: Kevin Per <kevin.per@ebcont.com>
 Date: Tue, 13 Oct 2026 09:16:31 +0200
-Subject: [PATCH 09/10] Setup flaky-web, grafana and load-testing
+Subject: [PATCH 09/11] Setup flaky-web, grafana and load-testing
 
 ---
  k8s/grafana/alloy.yaml                 |  39 +++
