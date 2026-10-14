@@ -1,7 +1,7 @@
 From d32124b97d0574dbf28e581ddf21514c8be10d1a Mon Sep 17 00:00:00 2001
 From: Kevin Per <kevin.per@ebcont.com>
 Date: Tue, 13 Oct 2026 11:18:57 +0200
-Subject: [PATCH 11/14] Propose fixes for broken workloads
+Subject: [PATCH 11/15] Propose fixes for broken workloads
 
 ---
  scripts/flaky-web/k8s.yaml                    |   2 +

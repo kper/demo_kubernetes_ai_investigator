@@ -1,7 +1,7 @@
 From 289243e7677a1213ad78a0d728bbc830fd55034a Mon Sep 17 00:00:00 2001
 From: Kevin Per <kevin.per@ebcont.com>
 Date: Wed, 14 Oct 2026 11:31:46 +0200
-Subject: [PATCH 14/14] Add justifications
+Subject: [PATCH 14/15] Add justifications
 
 ---
  .../ebcont/k8/triage/RollbackProposal.java    | 24 +++++++++---
