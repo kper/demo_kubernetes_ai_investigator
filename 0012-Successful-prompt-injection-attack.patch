@@ -1,7 +1,7 @@
 From ed24337392589d610cbe8095465d0198b88ef977 Mon Sep 17 00:00:00 2001
 From: Kevin Per <kevin.per@ebcont.com>
 Date: Tue, 13 Oct 2026 14:12:00 +0200
-Subject: [PATCH 12/13] Successful prompt injection attack
+Subject: [PATCH 12/14] Successful prompt injection attack
 
 ---
  scripts/prompt-injection-up.sh           | 50 ++++++++++++++++++++++++

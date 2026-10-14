@@ -1,7 +1,7 @@
 From 871040f71f9b49f97a5271ab3bd0962b1afa5701 Mon Sep 17 00:00:00 2001
 From: Kevin Per <kevin.per@ebcont.com>
 Date: Mon, 12 Oct 2026 09:24:19 +0200
-Subject: [PATCH 04/13] Setup the triage agent to inspect workloads for errors
+Subject: [PATCH 04/14] Setup the triage agent to inspect workloads for errors
 
 ---
  .gitignore                                    |  2 +
