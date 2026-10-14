@@ -1,7 +1,7 @@
 From e5c9dbd88cea583afd011c424e760d4e04c76207 Mon Sep 17 00:00:00 2001
 From: Kevin Per <kevin.per@ebcont.com>
 Date: Mon, 12 Oct 2026 09:58:36 +0200
-Subject: [PATCH 06/11] Created root cause agent
+Subject: [PATCH 06/13] Created root cause agent
 
 ---
  .../k8/triage/KubernetesDiagnosticTools.java  | 45 +++++++---

@@ -1,0 +1,287 @@
+From ade8fdb2ab6b3652692400b63634e6c768965be9 Mon Sep 17 00:00:00 2001
+From: Kevin Per <kevin.per@ebcont.com>
+Date: Wed, 14 Oct 2026 09:54:55 +0200
+Subject: [PATCH 13/13] Enable AWS guardrails
+
+---
+ .../triage/BedrockGuardrailInterceptor.java   | 46 ++++++++++++++++++
+ .../java/com/ebcont/k8/triage/FixAgent.java   |  3 ++
+ .../com/ebcont/k8/triage/GuardrailBlock.java  | 48 +++++++++++++++++++
+ .../ebcont/k8/triage/InvestigatorAgent.java   |  3 ++
+ .../com/ebcont/k8/triage/RootCauseAgent.java  | 10 +++-
+ .../com/ebcont/k8/triage/RootCauseReport.java | 14 +++++-
+ .../com/ebcont/k8/triage/TriageWorkers.java   | 23 +++++++--
+ .../bedrockruntime/execution.interceptors     |  1 +
+ 8 files changed, 142 insertions(+), 6 deletions(-)
+ create mode 100644 src/main/java/com/ebcont/k8/triage/BedrockGuardrailInterceptor.java
+ create mode 100644 src/main/java/com/ebcont/k8/triage/GuardrailBlock.java
+ create mode 100644 src/main/resources/software/amazon/awssdk/services/bedrockruntime/execution.interceptors
+
+diff --git a/src/main/java/com/ebcont/k8/triage/BedrockGuardrailInterceptor.java b/src/main/java/com/ebcont/k8/triage/BedrockGuardrailInterceptor.java
+new file mode 100644
+index 0000000..32adcd6
+--- /dev/null
++++ b/src/main/java/com/ebcont/k8/triage/BedrockGuardrailInterceptor.java
+@@ -0,0 +1,46 @@
++package com.ebcont.k8.triage;
++
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++import software.amazon.awssdk.core.SdkRequest;
++import software.amazon.awssdk.core.interceptor.Context;
++import software.amazon.awssdk.core.interceptor.ExecutionAttributes;
++import software.amazon.awssdk.core.interceptor.ExecutionInterceptor;
++import software.amazon.awssdk.services.bedrockruntime.model.ConverseRequest;
++import software.amazon.awssdk.services.bedrockruntime.model.ConverseStreamRequest;
++
++/**
++ * Applies an Amazon Bedrock guardrail to every Converse call, from the environment:
++ * BEDROCK_GUARDRAIL_ID (id or ARN) and BEDROCK_GUARDRAIL_VERSION (default DRAFT). 
++ */
++public class BedrockGuardrailInterceptor implements ExecutionInterceptor {
++
++    private static final Logger log = LoggerFactory.getLogger(BedrockGuardrailInterceptor.class);
++
++    private final String id = System.getenv("BEDROCK_GUARDRAIL_ID");
++    private final String version = System.getenv().getOrDefault("BEDROCK_GUARDRAIL_VERSION", "DRAFT");
++
++    public BedrockGuardrailInterceptor() {
++        if (enabled()) {
++            log.info("Bedrock guardrail {} (version {}) applies to every Converse call", id, version);
++        }
++    }
++
++    @Override
++    public SdkRequest modifyRequest(Context.ModifyRequest context, ExecutionAttributes executionAttributes) {
++        if (!enabled()) {
++            return context.request();
++        }
++        return switch (context.request()) {
++            case ConverseRequest request ->
++                    request.toBuilder().guardrailConfig(g -> g.guardrailIdentifier(id).guardrailVersion(version)).build();
++            case ConverseStreamRequest request ->
++                    request.toBuilder().guardrailConfig(g -> g.guardrailIdentifier(id).guardrailVersion(version)).build();
++            default -> context.request();
++        };
++    }
++
++    private boolean enabled() {
++        return id != null && !id.isBlank();
++    }
++}
+diff --git a/src/main/java/com/ebcont/k8/triage/FixAgent.java b/src/main/java/com/ebcont/k8/triage/FixAgent.java
+index abe7d48..afd6138 100644
+--- a/src/main/java/com/ebcont/k8/triage/FixAgent.java
++++ b/src/main/java/com/ebcont/k8/triage/FixAgent.java
+@@ -70,6 +70,9 @@ public class FixAgent {
+                         fix.suggestedFix(), source(new GitHubRepository(fix.sourceRepository(), http, githubToken))))
+                 .call()
+                 .content();
++        GuardrailBlock.in(answer).ifPresent(block -> {
++            throw new GuardrailBlock.BlockedException("fix agent", block);
++        });
+         // gpt-oss sometimes ends with reasoning only and no text.
+         return Objects.requireNonNullElse(answer, "(no proposal: the model returned no text)");
+     }
+diff --git a/src/main/java/com/ebcont/k8/triage/GuardrailBlock.java b/src/main/java/com/ebcont/k8/triage/GuardrailBlock.java
+new file mode 100644
+index 0000000..740d11c
+--- /dev/null
++++ b/src/main/java/com/ebcont/k8/triage/GuardrailBlock.java
+@@ -0,0 +1,48 @@
++package com.ebcont.k8.triage;
++
++import com.fasterxml.jackson.annotation.JsonPropertyDescription;
++import tools.jackson.core.JacksonException;
++import tools.jackson.databind.JsonNode;
++import tools.jackson.databind.json.JsonMapper;
++
++import java.util.Optional;
++
++/**
++ * A Bedrock guardrail block (BedrockGuardrailInterceptor). When the guardrail blocks a call, Bedrock returns the
++ * guardrail's configured message instead of the model's reply. That message is a root cause report without findings
++ * that marks the block, so every agent can recognise it:
++ * {@code {"findings":[],"blocked":{"by":"guardrail","stage":"input","message":"..."}}} (stage "input" or "output").
++ */
++public record GuardrailBlock(
++        @JsonPropertyDescription("Always \"guardrail\"")
++        String by,
++        @JsonPropertyDescription("\"input\" if the request was blocked, \"output\" if the model's answer was")
++        String stage,
++        @JsonPropertyDescription("Why it was blocked")
++        String message) {
++
++    /** The block in a model reply that is the guardrail's message, or empty for a normal reply. */
++    public static Optional<GuardrailBlock> in(String reply) {
++        if (reply == null || !reply.contains("\"blocked\"")) {
++            return Optional.empty();
++        }
++        try {
++            JsonNode blocked = JsonMapper.shared().readTree(reply.trim()).path("blocked");
++            if (!"guardrail".equals(blocked.path("by").asString(""))) {
++                return Optional.empty();
++            }
++            return Optional.of(new GuardrailBlock("guardrail", blocked.path("stage").asString(""),
++                    blocked.path("message").asString("")));
++        } catch (JacksonException e) {
++            return Optional.empty();
++        }
++    }
++
++    /** Thrown by an agent whose call the guardrail blocked; the step's result would be meaningless. */
++    public static class BlockedException extends RuntimeException {
++
++        public BlockedException(String agent, GuardrailBlock block) {
++            super("Bedrock guardrail blocked the " + agent + " (" + block.stage() + "): " + block.message());
++        }
++    }
++}
+diff --git a/src/main/java/com/ebcont/k8/triage/InvestigatorAgent.java b/src/main/java/com/ebcont/k8/triage/InvestigatorAgent.java
+index 2f74167..e8eaa7d 100644
+--- a/src/main/java/com/ebcont/k8/triage/InvestigatorAgent.java
++++ b/src/main/java/com/ebcont/k8/triage/InvestigatorAgent.java
+@@ -76,6 +76,9 @@ public class InvestigatorAgent {
+                     .advisors(a -> a.param(ChatMemory.CONVERSATION_ID, conversationId))
+                     .call()
+                     .content();
++            GuardrailBlock.in(answer).ifPresent(block -> {
++                throw new GuardrailBlock.BlockedException("investigator", block);
++            });
+             return new Investigation(Objects.requireNonNullElse(answer, "(no final message)"),
+                     evidence(chatMemory.get(conversationId)));
+         } finally {
+diff --git a/src/main/java/com/ebcont/k8/triage/RootCauseAgent.java b/src/main/java/com/ebcont/k8/triage/RootCauseAgent.java
+index e816c34..7c3d9f1 100644
+--- a/src/main/java/com/ebcont/k8/triage/RootCauseAgent.java
++++ b/src/main/java/com/ebcont/k8/triage/RootCauseAgent.java
+@@ -1,5 +1,9 @@
+ package com.ebcont.k8.triage;
+ 
++import com.fasterxml.jackson.core.JsonParser;
++import com.fasterxml.jackson.core.JsonProcessingException;
++import com.fasterxml.jackson.databind.ObjectMapper;
++import com.fasterxml.jackson.databind.ObjectWriter;
+ import org.springframework.ai.chat.client.ChatClient;
+ import org.springframework.stereotype.Component;
+ 
+@@ -33,10 +37,14 @@ public class RootCauseAgent {
+ 
+     public RootCauseReport analyse(List<String> toolEvidence, String investigatorAnswer) {
+         String evidence = toolEvidence.isEmpty() ? "(no tool calls)" : String.join("\n\n", toolEvidence);
+-        return chatClient.prompt()
++        RootCauseReport report = chatClient.prompt()
+                 .user("## Tool calls and their output\n\n" + evidence
+                         + "\n\n## Investigator's final message\n\n" + investigatorAnswer)
+                 .call()
+                 .entity(RootCauseReport.class);
++        if (report.blocked() != null) {
++            throw new GuardrailBlock.BlockedException("root cause agent", report.blocked());
++        }
++        return report;
+     }
+ }
+diff --git a/src/main/java/com/ebcont/k8/triage/RootCauseReport.java b/src/main/java/com/ebcont/k8/triage/RootCauseReport.java
+index c1cc956..1e5cbd8 100644
+--- a/src/main/java/com/ebcont/k8/triage/RootCauseReport.java
++++ b/src/main/java/com/ebcont/k8/triage/RootCauseReport.java
+@@ -7,7 +7,19 @@ import java.util.List;
+ /** Structured output of the {@link RootCauseAgent}: one finding per unhealthy workload. */
+ public record RootCauseReport(
+         @JsonPropertyDescription("One entry per unhealthy workload")
+-        List<Finding> findings) {
++        List<Finding> findings,
++        @JsonPropertyDescription("Always leave null: only the guardrail's block message sets it")
++        GuardrailBlock blocked) {
++
++    /**
++     * The model fills the schema's "blocked" object with nulls instead of leaving it out. Only the guardrail's block
++     * message sets by="guardrail", so anything else means the report is not blocked.
++     */
++    public RootCauseReport {
++        if (blocked != null && !"guardrail".equals(blocked.by())) {
++            blocked = null;
++        }
++    }
+ 
+     public record Finding(
+             @JsonPropertyDescription("Namespace of the workload")
+diff --git a/src/main/java/com/ebcont/k8/triage/TriageWorkers.java b/src/main/java/com/ebcont/k8/triage/TriageWorkers.java
+index 81a54ef..a199932 100644
+--- a/src/main/java/com/ebcont/k8/triage/TriageWorkers.java
++++ b/src/main/java/com/ebcont/k8/triage/TriageWorkers.java
+@@ -3,6 +3,7 @@ package com.ebcont.k8.triage;
+ import io.camunda.client.annotation.JobWorker;
+ import io.camunda.client.annotation.Variable;
+ import io.camunda.client.api.response.ActivatedJob;
++import io.camunda.client.exception.CamundaError;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+@@ -11,6 +12,7 @@ import org.springframework.stereotype.Component;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.Objects;
++import java.util.function.Supplier;
+ 
+ /** Job workers for the service tasks of the k8-triage process (src/main/resources/bpmn/k8-triage.bpmn). */
+ @Component
+@@ -38,8 +40,8 @@ public class TriageWorkers {
+     @JobWorker(type = "investigate", timeout = LLM_TIMEOUT_MS, fetchVariables = "namespaces")
+     public Map<String, Object> investigate(ActivatedJob job, @Variable("namespaces") List<String> namespaces) {
+         log.info("Starting investigation of namespaces {}", namespaces);
+-        InvestigatorAgent.Investigation investigation =
+-                investigator.investigate("triage-" + job.getProcessInstanceKey(), namespaces);
++        InvestigatorAgent.Investigation investigation = incidentIfBlocked(() ->
++                investigator.investigate("triage-" + job.getProcessInstanceKey(), namespaces));
+         log.info("Investigator: {}", investigation.answer());
+         return Map.of("investigationEvidence", investigation.evidence(), "investigationAnswer", investigation.answer());
+     }
+@@ -49,7 +51,7 @@ public class TriageWorkers {
+     public Map<String, Object> analyse(@Variable("investigationEvidence") List<String> evidence,
+                                        @Variable("investigationAnswer") String answer) {
+         log.info("Running root cause analysis on {} tool results", evidence.size());
+-        RootCauseReport report = rootCause.analyse(evidence, answer);
++        RootCauseReport report = incidentIfBlocked(() -> rootCause.analyse(evidence, answer));
+         report.findings().forEach(TriageWorkers::logFinding);
+         List<RollbackProposal> rollbacks = report.findings().stream()
+                 .map(RollbackProposal::of)
+@@ -67,7 +69,7 @@ public class TriageWorkers {
+     @JobWorker(type = "propose-fix", timeout = LLM_TIMEOUT_MS, fetchVariables = "fix")
+     public Map<String, Object> proposeFix(@Variable("fix") FixCandidate fix) {
+         log.info("Proposing a fix for {} in {}", fix.key(), fix.repository());
+-        String proposal = fixAgent.propose(fix);
++        String proposal = incidentIfBlocked(() -> fixAgent.propose(fix));
+         log.info("Fix proposal for {}, waiting for review in Tasklist: http://localhost:8080/tasklist\n{}",
+                 fix.key(), proposal);
+         return Map.of("fixProposal", proposal);
+@@ -85,6 +87,19 @@ public class TriageWorkers {
+         return Map.of("rollbackResult", result);
+     }
+ 
++    /**
++     * A call the Bedrock guardrail blocked would be blocked again, so it fails the job without retries: an incident in
++     * Operate with the guardrail's message, for a human to look at what triggered it.
++     */
++    private static <T> T incidentIfBlocked(Supplier<T> agentCall) {
++        try {
++            return agentCall.get();
++        } catch (GuardrailBlock.BlockedException e) {
++            log.warn(e.getMessage());
++            throw CamundaError.jobError(e.getMessage(), Map.of(), 0);
++        }
++    }
++
+     private static void logFinding(RootCauseReport.Finding finding) {
+         String command = RootCauseReport.rollbackCommand(finding);
+         String reason = finding.rollback() == null ? "" : " (" + finding.rollback().reason() + ")";
+diff --git a/src/main/resources/software/amazon/awssdk/services/bedrockruntime/execution.interceptors b/src/main/resources/software/amazon/awssdk/services/bedrockruntime/execution.interceptors
+new file mode 100644
+index 0000000..742dff0
+--- /dev/null
++++ b/src/main/resources/software/amazon/awssdk/services/bedrockruntime/execution.interceptors
+@@ -0,0 +1 @@
++com.ebcont.k8.triage.BedrockGuardrailInterceptor
+-- 
+2.53.0
+

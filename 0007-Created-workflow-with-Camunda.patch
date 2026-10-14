@@ -1,7 +1,7 @@
 From 85817a3603fd0934fddbbc89b0e5dcbcd19e2927 Mon Sep 17 00:00:00 2001
 From: Kevin Per <kevin.per@ebcont.com>
 Date: Mon, 12 Oct 2026 10:35:23 +0200
-Subject: [PATCH 07/11] Created workflow with Camunda
+Subject: [PATCH 07/13] Created workflow with Camunda
 
 ---
  build.gradle                                  |   1 +
